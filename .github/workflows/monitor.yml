@@ -28,9 +28,8 @@ jobs:
           cat > monitor.py <<'PY'
           from playwright.sync_api import sync_playwright
           from datetime import datetime
-          import json
+          import os
           import re
-          import time
 
           URL = "https://www.hurtigruten.com/en/port-to-port"
 
@@ -43,76 +42,77 @@ jobs:
           TARGET_DATE = "2027-02-07"
 
 
-          def log(msg):
-              print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
+          def log(message):
+              print(
+                  f"[{datetime.utcnow().isoformat()}] {message}",
+                  flush=True
+              )
 
 
-          def screenshot(page, name):
+          def safe_name(text):
+              return re.sub(r"[^A-Za-z0-9_-]+", "_", text)
+
+
+          def save_screenshot(page, name):
               try:
                   page.screenshot(
-                      path=f"{name}.png",
+                      path=f"{safe_name(name)}.png",
                       full_page=True
                   )
               except Exception as e:
                   log(f"Screenshot failed: {e}")
 
 
-          def dump_page(page, name):
-              log(f"URL: {page.url}")
-              log(f"TITLE: {page.title()}")
-
+          def page_text(page):
               try:
-                  text = page.locator("body").inner_text(timeout=30000)
-                  print(text[:30000])
+                  return page.locator("body").inner_text(
+                      timeout=30000
+                  )
               except Exception as e:
-                  log(f"Could not read body: {e}")
+                  log(f"Could not read page text: {e}")
+                  return ""
 
-              screenshot(page, name)
 
-
-          def choose_port(page, index, port):
-              """
-              The current Hurtigruten page exposes the two route fields
-              as the first two relevant text inputs.
-              """
-
+          def select_port(page, input_index, port):
               inputs = page.locator("input")
 
-              if inputs.count() < 2:
+              if inputs.count() <= input_index:
                   raise RuntimeError(
-                      f"Expected at least 2 inputs, found {inputs.count()}"
+                      f"Input {input_index} not found"
                   )
 
-              box = inputs.nth(index)
+              box = inputs.nth(input_index)
 
               log(
-                  f"Selecting {'FROM' if index == 0 else 'TO'} port: "
+                  f"Selecting "
+                  f"{'FROM' if input_index == 0 else 'TO'}: "
                   f"{port}"
               )
 
               box.click()
               box.fill(port)
 
-              page.wait_for_timeout(1500)
+              page.wait_for_timeout(2000)
 
-              # Hurtigruten displays autocomplete options.
-              # Prefer an exact visible text match.
-              exact = page.get_by_text(port, exact=True)
+              # Exact visible autocomplete result.
+              exact = page.get_by_text(
+                  port,
+                  exact=True
+              )
 
-              if exact.count() > 0:
-                  for i in range(exact.count() - 1, -1, -1):
-                      try:
-                          candidate = exact.nth(i)
-                          if candidate.is_visible():
-                              candidate.click()
-                              page.wait_for_timeout(1000)
-                              log(f"Selected: {port}")
-                              return
-                      except Exception:
-                          pass
+              for i in range(exact.count() - 1, -1, -1):
+                  try:
+                      item = exact.nth(i)
 
-              # Fallback: click an autocomplete/list option containing
-              # the port name.
+                      if item.is_visible():
+                          item.click()
+                          page.wait_for_timeout(1000)
+                          log(f"Selected {port}")
+                          return
+                  except Exception:
+                      pass
+
+              # Fallback for autocomplete options.
               candidates = page.locator(
                   '[role="option"], '
                   'li, '
@@ -122,67 +122,127 @@ jobs:
 
               for i in range(candidates.count()):
                   try:
-                      candidate = candidates.nth(i)
+                      item = candidates.nth(i)
 
-                      if not candidate.is_visible():
+                      if not item.is_visible():
                           continue
 
-                      text = candidate.inner_text().strip()
+                      text = item.inner_text().strip()
 
                       if port.lower() in text.lower():
-                          candidate.click()
+                          item.click()
                           page.wait_for_timeout(1000)
-                          log(f"Selected by fallback: {text}")
+                          log(f"Selected fallback: {text}")
                           return
                   except Exception:
                       pass
 
               raise RuntimeError(
-                  f"Could not select port '{port}'"
+                  f"Could not select port: {port}"
               )
 
 
-          def find_search_button(page):
-              texts = [
-                  "Search",
-                  "Show availability",
-                  "Find availability",
-                  "Continue"
+          def select_date_if_available(page):
+              log(f"Trying to set date: {TARGET_DATE}")
+
+              # First try native date inputs.
+              date_inputs = page.locator(
+                  'input[type="date"]'
+              )
+
+              for i in range(date_inputs.count()):
+                  try:
+                      field = date_inputs.nth(i)
+
+                      if field.is_visible() and field.is_enabled():
+                          field.fill(TARGET_DATE)
+                          log("Date filled using input[type=date]")
+                          page.wait_for_timeout(1000)
+                          return True
+                  except Exception:
+                      pass
+
+              # Then try accessible labels.
+              labels = [
+                  "Departure date",
+                  "Date",
+                  "Travel date",
+                  "Departure"
               ]
 
-              for text in texts:
+              for label in labels:
+                  try:
+                      field = page.get_by_label(
+                          re.compile(label, re.I)
+                      ).first
+
+                      if field.is_visible() and field.is_enabled():
+                          try:
+                              field.fill(TARGET_DATE)
+                              log(
+                                  f"Date filled using label: {label}"
+                              )
+                              page.wait_for_timeout(1000)
+                              return True
+                          except Exception:
+                              pass
+                  except Exception:
+                      pass
+
+              log(
+                  "No directly editable date field found. "
+                  "Continuing with route search."
+              )
+
+              return False
+
+
+          def find_search_button(page):
+              patterns = [
+                  r"^Search$",
+                  r"Search",
+                  r"Show availability",
+                  r"Find availability",
+                  r"Check availability",
+                  r"Continue"
+              ]
+
+              for pattern in patterns:
                   buttons = page.get_by_role(
                       "button",
-                      name=re.compile(text, re.I)
+                      name=re.compile(pattern, re.I)
                   )
 
                   for i in range(buttons.count()):
                       try:
-                          b = buttons.nth(i)
+                          button = buttons.nth(i)
 
-                          if b.is_visible() and b.is_enabled():
-                              return b
+                          if (
+                              button.is_visible()
+                              and button.is_enabled()
+                          ):
+                              return button
                       except Exception:
                           pass
 
-              # Generic fallback
+              # Generic button fallback.
               buttons = page.locator("button")
 
               for i in range(buttons.count()):
                   try:
-                      b = buttons.nth(i)
+                      button = buttons.nth(i)
 
-                      if not b.is_visible():
+                      if not button.is_visible():
                           continue
 
-                      txt = b.inner_text().strip()
+                      text = button.inner_text().strip()
 
                       if re.search(
                           r"search|availability|continue",
-                          txt,
+                          text,
                           re.I
                       ):
-                          return b
+                          return button
                   except Exception:
                       pass
 
@@ -190,94 +250,85 @@ jobs:
 
 
           def inspect_result(page, route):
-              body = ""
-
-              try:
-                  body = page.locator("body").inner_text(
-                      timeout=30000
-                  )
-              except Exception as e:
-                  log(f"Could not read result page: {e}")
-
-              lower = body.lower()
+              text = page_text(page)
+              lower = text.lower()
 
               log("----- RESULT PAGE -----")
-              print(body[:40000])
+              log(f"URL: {page.url}")
+              log(f"TITLE: {page.title()}")
+              print(text[:40000])
 
-              # These indicate that the site reached a booking/result page.
-              positive_patterns = [
-                  "select departure",
-                  "from",
-                  "to",
-                  "showing voyages",
-                  "available",
-                  "price",
-                  "departure"
-              ]
+              save_screenshot(
+                  page,
+                  "result_"
+                  + route[0]
+                  + "_"
+                  + route[1]
+              )
 
               negative_patterns = [
                   "no availability",
                   "no voyages",
                   "no sailings",
                   "not available",
-                  "connection issue has occured",
-                  "connection issue has occurred"
+                  "sold out",
+                  "no results",
+                  "nothing found"
               ]
 
-              positive_score = sum(
-                  1 for x in positive_patterns
+              positive_patterns = [
+                  "available",
+                  "availability",
+                  "departure",
+                  "sailing",
+                  "voyage",
+                  "price"
+              ]
+
+              negative_hits = [
+                  x for x in negative_patterns
                   if x in lower
-              )
+              ]
 
-              negative_score = sum(
-                  1 for x in negative_patterns
+              positive_hits = [
+                  x for x in positive_patterns
                   if x in lower
-              )
+              ]
 
-              log(
-                  f"Result analysis: positive={positive_score}, "
-                  f"negative={negative_score}"
-              )
-
-              screenshot(
-                  page,
-                  "result-"
-                  + route[0].replace(" ", "_")
-                  + "-"
-                  + route[1].replace(" ", "_")
-              )
-
-              # We deliberately do NOT claim availability merely because
-              # the page loaded. We only mark it as interesting when the
-              # result page contains meaningful sailing/price information.
+              # Detect common currency / price formats.
               has_price = bool(
-                  re.search(r"(€|EUR|£|\$)\s?\d+", body)
-                  or re.search(r"\d+\s?(EUR|NOK|GBP|USD)", body)
+                  re.search(
+                      r"(€|EUR|NOK|£|GBP|\$|USD)\s?\d",
+                      text,
+                      re.I
+                  )
+                  or
+                  re.search(
+                      r"\d[\d,.]*\s?(EUR|NOK|GBP|USD)",
+                      text,
+                      re.I
+                  )
               )
 
-              has_voyage_language = any(
-                  x in lower
-                  for x in [
-                      "select departure",
-                      "showing voyages",
-                      "departure",
-                      "sailing"
-                  ]
+              log(f"Positive terms: {positive_hits}")
+              log(f"Negative terms: {negative_hits}")
+              log(f"Price detected: {has_price}")
+
+              # Conservative rule:
+              # email only when there is meaningful result information
+              # and no explicit "no availability" message.
+              potential = (
+                  len(positive_hits) >= 2
+                  and not negative_hits
+                  and (
+                      has_price
+                      or "departure" in lower
+                      or "sailing" in lower
+                      or "voyage" in lower
+                  )
               )
 
-              interesting = (
-                  positive_score >= 2
-                  and negative_score == 0
-                  and (has_price or has_voyage_language)
-              )
-
-              return {
-                  "route": route,
-                  "target_date": TARGET_DATE,
-                  "interesting": interesting,
-                  "has_price": has_price,
-                  "url": page.url,
-              }
+              return potential
 
 
           def check_route(browser, route):
@@ -295,7 +346,10 @@ jobs:
               try:
                   log("")
                   log("=" * 80)
-                  log(f"CHECKING ROUTE: {route[0]} -> {route[1]}")
+                  log(
+                      f"CHECKING: "
+                      f"{route[0]} -> {route[1]}"
+                  )
                   log("=" * 80)
 
                   page.goto(
@@ -304,54 +358,48 @@ jobs:
                       timeout=120000
                   )
 
-                  page.wait_for_timeout(8000)
+                  page.wait_for_timeout(10000)
 
-                  dump_page(
+                  save_screenshot(
                       page,
-                      "main-"
-                      + route[0].replace(" ", "_")
-                      + "-"
-                      + route[1].replace(" ", "_")
+                      "before_"
+                      + route[0]
+                      + "_"
+                      + route[1]
                   )
 
-                  choose_port(page, 0, route[0])
-                  choose_port(page, 1, route[1])
+                  log(
+                      f"Initial URL: {page.url}"
+                  )
+
+                  # The verified page exposes these as the first
+                  # two relevant inputs.
+                  select_port(page, 0, route[0])
+                  select_port(page, 1, route[1])
 
                   page.wait_for_timeout(1500)
 
-                  log("Route selected successfully.")
+                  # Try date if the page exposes an editable date field.
+                  select_date_if_available(page)
 
-                  # Inspect buttons before clicking.
-                  buttons = page.locator("button")
+                  page.wait_for_timeout(1500)
 
-                  for i in range(buttons.count()):
-                      try:
-                          b = buttons.nth(i)
+                  button = find_search_button(page)
 
-                          if not b.is_visible():
-                              continue
-
-                          txt = b.inner_text().strip()
-
-                          if txt:
-                              log(f"BUTTON {i}: {txt}")
-                      except Exception:
-                          pass
-
-                  search_button = find_search_button(page)
-
-                  if search_button is None:
+                  if button is None:
                       raise RuntimeError(
-                          "Search/availability button not found"
+                          "Could not find Search/Availability button"
                       )
 
-                  log("Clicking search button...")
+                  log(
+                      f"Clicking search button: "
+                      f"{button.inner_text().strip()}"
+                  )
 
-                  search_button.click()
+                  button.click()
 
                   page.wait_for_timeout(5000)
 
-                  # Wait for navigation or dynamic rendering.
                   try:
                       page.wait_for_load_state(
                           "domcontentloaded",
@@ -362,31 +410,47 @@ jobs:
 
                   page.wait_for_timeout(5000)
 
-                  result = inspect_result(
+                  potential = inspect_result(
                       page,
                       route
                   )
 
-                  return result
+                  if potential:
+                      log(
+                          "POTENTIAL AVAILABILITY FOUND: "
+                          f"{route[0]} -> {route[1]}"
+                      )
+
+                  else:
+                      log(
+                          "No confirmed/potential availability "
+                          "detected."
+                      )
+
+                  return {
+                      "route": route,
+                      "potential": potential,
+                      "url": page.url
+                  }
 
               except Exception as e:
                   log(
-                      f"ROUTE ERROR {route[0]} -> {route[1]}: "
+                      f"ERROR checking "
+                      f"{route[0]} -> {route[1]}: "
                       f"{type(e).__name__}: {e}"
                   )
 
-                  screenshot(
+                  save_screenshot(
                       page,
-                      "ERROR-"
-                      + route[0].replace(" ", "_")
-                      + "-"
-                      + route[1].replace(" ", "_")
+                      "ERROR_"
+                      + route[0]
+                      + "_"
+                      + route[1]
                   )
 
                   return {
                       "route": route,
-                      "target_date": TARGET_DATE,
-                      "interesting": False,
+                      "potential": False,
                       "error": str(e),
                       "url": page.url
                   }
@@ -396,65 +460,66 @@ jobs:
 
 
           def main():
-
               log("Starting Hurtigruten monitor")
               log(f"Target date: {TARGET_DATE}")
-              log(f"Routes: {ROUTES}")
 
-              results = []
+              found = []
 
               with sync_playwright() as p:
-
                   browser = p.chromium.launch(
                       headless=True
                   )
 
                   for route in ROUTES:
-
                       result = check_route(
                           browser,
                           route
                       )
 
-                      results.append(result)
-
-                      # Avoid hammering the website.
-                      time.sleep(3)
+                      if result.get("potential"):
+                          found.append(result)
 
                   browser.close()
 
-              log("")
-              log("=" * 80)
-              log("FINAL SUMMARY")
-              log("=" * 80)
+              # Only create this file when the monitor has found
+              # something worth notifying about.
+              if found:
+                  with open(
+                      "availability_found.txt",
+                      "w",
+                      encoding="utf-8"
+                  ) as f:
 
-              for result in results:
-                  log(json.dumps(
-                      result,
-                      ensure_ascii=False
-                  ))
-
-              interesting = [
-                  r for r in results
-                  if r.get("interesting")
-              ]
-
-              if interesting:
-                  log("")
-                  log("!!! POTENTIAL AVAILABILITY FOUND !!!")
-
-                  for r in interesting:
-                      log(
-                          f"{r['route'][0]} -> "
-                          f"{r['route'][1]} "
-                          f"{r['target_date']}"
+                      f.write(
+                          "Hurtigruten availability alert\n\n"
                       )
 
-              else:
-                  log("")
+                      f.write(
+                          f"Target date: {TARGET_DATE}\n\n"
+                      )
+
+                      for result in found:
+                          route = result["route"]
+
+                          f.write(
+                              f"Route: "
+                              f"{route[0]} -> {route[1]}\n"
+                          )
+
+                          f.write(
+                              f"URL: "
+                              f"{result.get('url', '')}\n\n"
+                          )
+
                   log(
-                      "No confirmed availability detected "
-                      "in this run."
+                      f"Created availability_found.txt "
+                      f"for {len(found)} route(s)."
+                  )
+
+              else:
+                  log(
+                      "No potential availability. "
+                      "No email will be sent."
                   )
 
 
@@ -465,10 +530,75 @@ jobs:
       - name: Run monitor
         run: python monitor.py
 
+      - name: Send QQ email alert
+        if: success() && hashFiles('availability_found.txt') != ''
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python - <<'PY'
+          import os
+          import smtplib
+          from email.mime.text import MIMEText
+          from email.header import Header
+
+          user = os.environ["SMTP_USER"]
+          password = os.environ["SMTP_PASSWORD"]
+          recipient = os.environ["ALERT_EMAIL"]
+
+          with open(
+              "availability_found.txt",
+              "r",
+              encoding="utf-8"
+          ) as f:
+              body = f.read()
+
+          message = MIMEText(
+              body,
+              "plain",
+              "utf-8"
+          )
+
+          message["Subject"] = Header(
+              "Hurtigruten 航次提醒",
+              "utf-8"
+          )
+
+          message["From"] = user
+          message["To"] = recipient
+
+          print(
+              f"Sending alert to {recipient}"
+          )
+
+          with smtplib.SMTP_SSL(
+              "smtp.qq.com",
+              465,
+              timeout=30
+          ) as smtp:
+
+              smtp.login(
+                  user,
+                  password
+              )
+
+              smtp.sendmail(
+                  user,
+                  [recipient],
+                  message.as_string()
+              )
+
+          print("QQ email sent successfully.")
+
+          PY
+
       - name: Save diagnostic screenshots
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: hurtigruten-diagnostics
-          path: "*.png"
+          path: |
+            *.png
+            availability_found.txt
           if-no-files-found: ignore
