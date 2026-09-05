@@ -1,4 +1,4 @@
-name: Hurtigruten Monitor Test
+name: Hurtigruten Monitor
 
 on:
   workflow_dispatch:
@@ -6,11 +6,91 @@ on:
     - cron: "*/15 * * * *"
 
 jobs:
-  test:
+  monitor:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
         run: |
-          echo "Hurtigruten monitor is working!"
-          date
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Create monitor script
+        run: |
+          cat > monitor.py <<'PY'
+          from playwright.sync_api import sync_playwright
+          from datetime import datetime
+
+          URL = "https://www.hurtigruten.com/en/port-to-port"
+
+          ROUTES = [
+              ("Svolvær", "Skjervøy"),
+              ("Svolvær", "Tromsø"),
+              ("Bodø", "Tromsø"),
+          ]
+
+          DATE = "2027-02-07"
+
+          def main():
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(
+                      headless=True,
+                      args=[
+                          "--disable-blink-features=AutomationControlled"
+                      ]
+                  )
+
+                  page = browser.new_page(
+                      viewport={"width": 1440, "height": 1000},
+                      locale="en-GB",
+                      timezone_id="Europe/Oslo",
+                  )
+
+                  print("Opening Hurtigruten...")
+                  page.goto(
+                      URL,
+                      wait_until="domcontentloaded",
+                      timeout=90000
+                  )
+
+                  page.wait_for_timeout(8000)
+
+                  print("PAGE TITLE:")
+                  print(page.title())
+
+                  print("\nPAGE URL:")
+                  print(page.url)
+
+                  print("\nPAGE TEXT:")
+                  text = page.locator("body").inner_text(timeout=30000)
+                  print(text[:20000])
+
+                  page.screenshot(
+                      path="hurtigruten-page.png",
+                      full_page=True
+                  )
+
+                  browser.close()
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run monitor
+        run: python monitor.py
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hurtigruten-page
+          path: hurtigruten-page.png
+          if-no-files-found: ignore
