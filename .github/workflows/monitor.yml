@@ -1,0 +1,16 @@
+name: Hurtigruten Monitor Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Test
+        run: |
+          echo "Hurtigruten monitor is working!"
+          date
