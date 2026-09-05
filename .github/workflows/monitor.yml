@@ -36,9 +36,10 @@ jobs:
           from email.mime.multipart import MIMEMultipart
           from playwright.sync_api import sync_playwright
 
-          URL = "https://www.hurtigruten.com/en/port-to-port"
-          BOOKING_URL = "https://www.hurtigruten.com/en/port-to-port/booking"
-          TARGET_DATE = "2027-02-07"
+          HOME = "https://www.hurtigruten.com/en/port-to-port"
+          BOOKING = "https://www.hurtigruten.com/en/port-to-port/booking"
+
+          TARGET = "2027-02-07"
 
           ROUTES = [
               ("Svolvær", "Skjervøy", "svolvaer-skjer"),
@@ -50,307 +51,319 @@ jobs:
           SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
           ALERT_EMAIL = os.environ["ALERT_EMAIL"]
 
-          def mail(subject, body):
+
+          def send_mail(subject, body):
               msg = MIMEMultipart()
               msg["From"] = SMTP_USER
               msg["To"] = ALERT_EMAIL
               msg["Subject"] = subject
               msg.attach(MIMEText(body, "plain", "utf-8"))
 
+              ctx = ssl.create_default_context()
+
               with smtplib.SMTP_SSL(
-                  "smtp.qq.com", 465,
-                  context=ssl.create_default_context(),
+                  "smtp.qq.com",
+                  465,
+                  context=ctx,
                   timeout=30
               ) as s:
                   s.login(SMTP_USER, SMTP_PASSWORD)
-                  s.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
+                  s.sendmail(
+                      SMTP_USER,
+                      [ALERT_EMAIL],
+                      msg.as_string()
+                  )
 
-          def clean(s):
+
+          def norm(s):
               return re.sub(r"\s+", " ", s or "").strip()
 
-          def select_port(page, port):
-              # 港口输入框：优先使用 placeholder
-              loc = page.locator(
-                  'input[placeholder*="Sail from" i], '
-                  'input[placeholder*="Sail to" i]'
-              )
 
-              if loc.count() == 0:
-                  loc = page.locator("input:visible")
+          def choose_port(page, port, field):
+              print(f"Selecting {field}: {port}")
 
-              # 找当前空的输入框
-              target = None
-              for i in range(loc.count()):
+              if field == "from":
+                  selectors = [
+                      'input[placeholder="Sail from where?"]',
+                      'input[placeholder*="Sail from"]',
+                  ]
+              else:
+                  selectors = [
+                      'input[placeholder="Sail to where?"]',
+                      'input[placeholder*="Sail to"]',
+                  ]
+
+              box = None
+
+              for selector in selectors:
                   try:
-                      x = loc.nth(i)
+                      x = page.locator(selector).first
                       if x.is_visible():
-                          target = x
+                          box = x
                           break
                   except:
                       pass
 
-              if target is None:
-                  raise RuntimeError(f"找不到 {port} 输入框")
+              if box is None:
+                  inputs = page.locator("input:visible")
+                  if inputs.count() < 2:
+                      raise RuntimeError(
+                          f"找不到 {field} 输入框"
+                      )
 
-              target.click()
-              target.fill("")
-              target.type(port, delay=60)
-              page.wait_for_timeout(1800)
-
-              # 精确优先：role=option
-              opts = page.locator('[role="option"]:visible')
-
-              for i in range(opts.count()):
-                  try:
-                      txt = clean(opts.nth(i).inner_text())
-                      if port.lower() in txt.lower():
-                          opts.nth(i).click()
-                          page.wait_for_timeout(1000)
-                          return
-                  except:
-                      pass
-
-              # 第二种：下拉列表中的可点击文字
-              candidates = page.locator(
-                  'li:visible, '
-                  '[data-testid*="option" i]:visible'
-              )
-
-              for i in range(candidates.count()):
-                  try:
-                      txt = clean(candidates.nth(i).inner_text())
-                      if port.lower() in txt.lower():
-                          candidates.nth(i).click()
-                          page.wait_for_timeout(1000)
-                          return
-                  except:
-                      pass
-
-              # 键盘方式
-              target.press("ArrowDown")
-              target.press("Enter")
-              page.wait_for_timeout(1000)
-
-              value = clean(target.input_value())
-
-              if port.lower() not in value.lower():
-                  raise RuntimeError(
-                      f"找不到港口: {port}; 当前输入值={value}"
+                  box = inputs.nth(
+                      0 if field == "from" else 1
                   )
 
-          def select_target_date(page):
-              wanted = [
-                  "7 February 2027",
-                  "07 February 2027",
-                  "February 7, 2027",
-                  "Feb 7, 2027",
-                  "07/02/2027",
-                  "2027-02-07",
-              ]
+              box.click()
+              box.fill("")
+              box.type(port, delay=80)
 
-              # 先检查 date input
-              dates = page.locator(
-                  'input[type="date"]:visible, '
-                  'input[name*="date" i]:visible'
+              page.wait_for_timeout(2000)
+
+              # 只从真正的 autocomplete option 中选择
+              options = page.locator(
+                  '[role="option"]:visible'
               )
 
-              for i in range(dates.count()):
+              for i in range(options.count()):
                   try:
-                      x = dates.nth(i)
-                      if x.is_visible():
-                          x.fill(TARGET_DATE)
+                      option = options.nth(i)
+                      text = norm(option.inner_text())
+
+                      print(
+                          f"{field} option {i}: {text}"
+                      )
+
+                      if port.casefold() in text.casefold():
+                          option.click()
                           page.wait_for_timeout(1000)
-                          return True
+                          return
                   except:
                       pass
 
-              # 检查页面上的日期按钮/文本
-              for text in wanted:
-                  try:
-                      x = page.get_by_text(
-                          text,
-                          exact=False
-                      ).first
-
-                      if x.count() and x.is_visible():
-                          x.click()
-                          page.wait_for_timeout(800)
-                          return True
-                  except:
-                      pass
-
-              # 检查 datetime / date 属性
-              elems = page.locator(
-                  '[data-date*="2027-02-07"], '
-                  '[data-value*="2027-02-07"], '
-                  '[value="2027-02-07"]'
+              # fallback：查找包含港口名称的列表项
+              items = page.locator(
+                  'li:visible'
               )
 
-              for i in range(elems.count()):
+              for i in range(items.count()):
                   try:
-                      elems.nth(i).click()
-                      page.wait_for_timeout(800)
-                      return True
+                      item = items.nth(i)
+                      text = norm(item.inner_text())
+
+                      if port.casefold() in text.casefold():
+                          item.click()
+                          page.wait_for_timeout(1000)
+                          return
                   except:
                       pass
 
-              return False
+              raise RuntimeError(
+                  f"找不到港口: {port}"
+              )
+
 
           def submit(page):
-              # 优先使用真正的 submit
-              submits = page.locator(
-                  'button[type="submit"]:visible, '
-                  'input[type="submit"]:visible'
+              print("Submitting search")
+
+              # 只寻找真正 submit 元素
+              buttons = page.locator(
+                  'button[type="submit"]:visible'
               )
 
-              for i in range(submits.count()):
+              for i in range(buttons.count()):
                   try:
-                      x = submits.nth(i)
-                      if x.is_enabled():
-                          x.click()
+                      b = buttons.nth(i)
+
+                      if b.is_enabled():
+                          print(
+                              "Submit button:",
+                              norm(b.inner_text())
+                          )
+                          b.click()
                           page.wait_for_timeout(6000)
                           return
                   except:
                       pass
 
-              # 最后才使用 Enter
-              inputs = page.locator("input:visible")
-              if inputs.count():
-                  try:
-                      inputs.last.press("Enter")
-                      page.wait_for_timeout(6000)
-                      return
-                  except:
-                      pass
+              # 如果网站没有 type=submit，
+              # 从 To 输入框 Enter
+              tobox = page.locator(
+                  'input[placeholder*="Sail to"]:visible'
+              ).first
 
-              raise RuntimeError("无法提交查询")
+              if tobox.count():
+                  tobox.press("Enter")
+                  page.wait_for_timeout(6000)
+                  return
 
-          def check(page, origin, destination, route_id):
+              raise RuntimeError(
+                  "无法提交 Port-to-Port 查询"
+              )
+
+
+          def collect(page):
+              body = page.locator(
+                  "body"
+              ).inner_text(timeout=15000)
+
+              url = page.url
+
+              print("CURRENT URL:")
+              print(url)
+
+              print("PAGE TEXT:")
+              print(body[:25000])
+
+              return url, body
+
+
+          def date_found(body):
+              b = body.casefold()
+
+              patterns = [
+                  "7 february 2027",
+                  "07 february 2027",
+                  "february 7, 2027",
+                  "feb 7, 2027",
+                  "07/02/2027",
+                  "7/2/2027",
+                  "2027-02-07",
+                  "07.02.2027",
+              ]
+
+              return any(
+                  x in b
+                  for x in patterns
+              )
+
+
+          def availability_found(body):
+              b = body.casefold()
+
+              bad = [
+                  "sold out",
+                  "fully booked",
+                  "no availability",
+                  "not available",
+                  "unavailable",
+                  "no departures",
+                  "no results",
+              ]
+
+              if any(x in b for x in bad):
+                  return False
+
+              good = [
+                  "book now",
+                  "available",
+                  "availability",
+                  "cabin",
+                  "deck space",
+                  "price",
+                  "€",
+                  "nok",
+              ]
+
+              return any(
+                  x in b
+                  for x in good
+              )
+
+
+          def check(page, origin, destination, rid):
+              print()
               print("=" * 70)
-              print(f"CHECK: {origin} -> {destination}")
+              print(
+                  f"CHECKING {origin} -> {destination}"
+              )
               print("=" * 70)
 
               page.goto(
-                  URL,
+                  HOME,
                   wait_until="domcontentloaded",
                   timeout=60000
               )
 
               page.wait_for_timeout(6000)
 
-              # FROM
-              select_port(page, origin)
+              choose_port(
+                  page,
+                  origin,
+                  "from"
+              )
 
-              # TO
-              select_port(page, destination)
-
-              # 尝试目标日期
-              date_selected = select_target_date(page)
-
-              print("TARGET DATE CONTROL:", date_selected)
+              choose_port(
+                  page,
+                  destination,
+                  "to"
+              )
 
               submit(page)
 
-              page.wait_for_timeout(7000)
+              page.wait_for_timeout(8000)
 
-              body = clean(
-                  page.locator("body").inner_text(timeout=15000)
-              )
-
-              print("URL:", page.url)
-              print(body[:20000])
-
-              # 目标日期严格判断
-              date_found = any(
-                  x.lower() in body.lower()
-                  for x in [
-                      "7 February 2027",
-                      "07 February 2027",
-                      "February 7, 2027",
-                      "Feb 7, 2027",
-                      "07/02/2027",
-                      "2027-02-07",
-                      "7/2/2027",
-                      "07.02.2027",
-                  ]
-              )
-
-              negative = [
-                  "sold out",
-                  "no availability",
-                  "not available",
-                  "fully booked",
-                  "unavailable",
-                  "no departures",
-                  "no results",
-                  "nothing available",
-              ]
-
-              positive = [
-                  "book now",
-                  "available",
-                  "availability",
-                  "cabins available",
-                  "price",
-                  "from €",
-                  "from $",
-                  "nok",
-              ]
-
-              no = any(x in body.lower() for x in negative)
-              yes = any(x in body.lower() for x in positive)
-
-              # 必须同时满足：
-              # 1. 找到目标日期
-              # 2. 页面出现价格/可订等信号
-              # 3. 没有明确售罄
-              available = date_found and yes and not no
-
-              print("DATE FOUND:", date_found)
-              print("POSITIVE:", yes)
-              print("NEGATIVE:", no)
-              print("AVAILABLE:", available)
+              url, body = collect(page)
 
               page.screenshot(
-                  path=f"{route_id}.png",
+                  path=f"{rid}.png",
                   full_page=True
               )
 
-              return available, date_found, body
+              found_date = date_found(body)
+              found_availability = (
+                  found_date
+                  and availability_found(body)
+              )
+
+              print(
+                  f"DATE={found_date} "
+                  f"AVAILABLE={found_availability}"
+              )
+
+              return (
+                  found_availability,
+                  found_date,
+                  url,
+                  body
+              )
+
 
           results = []
-          failures = []
+          errors = []
           found = []
 
           with sync_playwright() as p:
-              browser = p.chromium.launch(headless=True)
+
+              browser = p.chromium.launch(
+                  headless=True
+              )
 
               context = browser.new_context(
-                  viewport={"width": 1440, "height": 1000},
+                  viewport={
+                      "width": 1440,
+                      "height": 1000
+                  },
                   locale="en-US",
-                  timezone_id="Europe/Oslo",
-                  user_agent=(
-                      "Mozilla/5.0 (X11; Linux x86_64) "
-                      "AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) "
-                      "Chrome/131.0.0.0 Safari/537.36"
-                  )
+                  timezone_id="Europe/Oslo"
               )
 
               page = context.new_page()
 
-              for origin, destination, route_id in ROUTES:
+              for origin, destination, rid in ROUTES:
+
                   try:
-                      available, date_found, body = check(
+                      available, target_date_found, url, body = check(
                           page,
                           origin,
                           destination,
-                          route_id
+                          rid
                       )
 
                       results.append(
                           f"{origin} -> {destination}: "
-                          f"date_found={date_found}, "
+                          f"target_date={target_date_found}, "
                           f"available={available}"
                       )
 
@@ -360,16 +373,17 @@ jobs:
                           )
 
                   except Exception as e:
+
                       print(traceback.format_exc())
 
-                      failures.append(
-                          f"{origin} -> {destination}\n"
+                      errors.append(
+                          f"{origin} -> {destination}: "
                           f"{type(e).__name__}: {e}"
                       )
 
                       try:
                           page.screenshot(
-                              path=f"{route_id}-ERROR.png",
+                              path=f"{rid}-ERROR.png",
                               full_page=True
                           )
                       except:
@@ -377,47 +391,53 @@ jobs:
 
               browser.close()
 
-          # 有票才发通知
+
+          # 有票才通知
           if found:
+
               body = (
-                  "Hurtigruten Port-to-Port availability found.\n\n"
-                  f"Target date: {TARGET_DATE}\n\n"
+                  "Hurtigruten availability found!\n\n"
+                  f"Target date: {TARGET}\n\n"
                   + "\n".join(found)
                   + "\n\n"
-                  "Booking page:\n"
-                  + BOOKING_URL
+                  "Booking:\n"
+                  + BOOKING
               )
 
-              mail(
-                  "Hurtigruten availability FOUND",
+              send_mail(
+                  "Hurtigruten - AVAILABLE",
                   body
               )
 
-          # 程序错误才发失败邮件
-          if failures:
+
+          # 程序真正报错才通知
+          if errors:
+
               body = (
                   "Hurtigruten monitor ERROR\n\n"
-                  f"Target date: {TARGET_DATE}\n\n"
-                  + "\n\n".join(failures)
+                  f"Target date: {TARGET}\n\n"
+                  + "\n".join(errors)
                   + "\n\nRESULTS:\n"
                   + "\n".join(results)
               )
 
-              mail(
-                  "Hurtigruten monitor ERROR",
+              send_mail(
+                  "Hurtigruten Monitor ERROR",
                   body
               )
 
+
           print()
-          print("FINAL RESULTS")
-          print("==============================")
+          print("=" * 70)
+          print("FINAL")
+          print("=" * 70)
+
           for x in results:
               print(x)
 
-          if failures:
-              print()
-              print("ERRORS")
-              for x in failures:
+          if errors:
+              print("ERRORS:")
+              for x in errors:
                   print(x)
           PY
 
@@ -426,7 +446,8 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
-        run: python monitor.py
+        run: |
+          python monitor.py
 
       - name: Upload diagnostics
         if: always()
