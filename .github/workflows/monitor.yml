@@ -23,7 +23,7 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
-      - name: Create monitor script
+      - name: Create monitor
         run: |
           cat > monitor.py <<'PY'
           from playwright.sync_api import sync_playwright
@@ -39,44 +39,88 @@ jobs:
 
           DATE = "2027-02-07"
 
+          def dump_page(page, name):
+              print("\n" + "=" * 80)
+              print(name)
+              print("=" * 80)
+              print("URL:", page.url)
+              print("TITLE:", page.title())
+
+              try:
+                  text = page.locator("body").inner_text(timeout=30000)
+                  print(text[:30000])
+              except Exception as e:
+                  print("Could not read page:", e)
+
+              page.screenshot(
+                  path=f"{name}.png",
+                  full_page=True
+              )
+
           def main():
               with sync_playwright() as p:
+
                   browser = p.chromium.launch(
-                      headless=True,
-                      args=[
-                          "--disable-blink-features=AutomationControlled"
-                      ]
+                      headless=True
                   )
 
-                  page = browser.new_page(
+                  context = browser.new_context(
                       viewport={"width": 1440, "height": 1000},
                       locale="en-GB",
-                      timezone_id="Europe/Oslo",
+                      timezone_id="Europe/Oslo"
                   )
 
-                  print("Opening Hurtigruten...")
+                  page = context.new_page()
+
+                  print("Starting Hurtigruten monitor")
+                  print("Time:", datetime.utcnow())
+
                   page.goto(
                       URL,
                       wait_until="domcontentloaded",
-                      timeout=90000
+                      timeout=120000
                   )
 
-                  page.wait_for_timeout(8000)
+                  page.wait_for_timeout(10000)
 
-                  print("PAGE TITLE:")
-                  print(page.title())
+                  dump_page(page, "hurtigruten-main")
 
-                  print("\nPAGE URL:")
-                  print(page.url)
+                  print("\n\nAvailable input fields:")
 
-                  print("\nPAGE TEXT:")
-                  text = page.locator("body").inner_text(timeout=30000)
-                  print(text[:20000])
+                  inputs = page.locator("input")
 
-                  page.screenshot(
-                      path="hurtigruten-page.png",
-                      full_page=True
-                  )
+                  for i in range(inputs.count()):
+                      try:
+                          el = inputs.nth(i)
+
+                          print(
+                              i,
+                              "placeholder=",
+                              el.get_attribute("placeholder"),
+                              "name=",
+                              el.get_attribute("name"),
+                              "type=",
+                              el.get_attribute("type"),
+                              "value=",
+                              el.input_value()
+                          )
+                      except Exception:
+                          pass
+
+                  print("\n\nButtons:")
+
+                  buttons = page.locator("button")
+
+                  for i in range(buttons.count()):
+                      try:
+                          el = buttons.nth(i)
+
+                          txt = el.inner_text().strip()
+
+                          if txt:
+                              print(i, repr(txt))
+                      except Exception:
+                          pass
 
                   browser.close()
 
@@ -87,10 +131,10 @@ jobs:
       - name: Run monitor
         run: python monitor.py
 
-      - name: Upload screenshot
+      - name: Save diagnostic screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hurtigruten-page
-          path: hurtigruten-page.png
+          name: hurtigruten-diagnostics
+          path: "*.png"
           if-no-files-found: ignore
