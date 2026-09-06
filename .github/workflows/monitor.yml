@@ -1,43 +1,40 @@
-name: Hurtigruten Monitor
+name: Hurtigruten Action Diagnostic
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/15 * * * *"
 
 jobs:
-  monitor:
+  diagnose:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install Playwright
         run: |
           pip install playwright
-          playwright install chromium
-          playwright install-deps chromium
+          playwright install --with-deps chromium
 
-      - name: Create diagnostic monitor
+      - name: Create diagnostic script
         run: |
           cat > monitor.py <<'PY'
+          import asyncio
           import json
           import os
           import re
-          import time
-          from pathlib import Path
-
-          from playwright.sync_api import sync_playwright
-
+          import smtplib
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+          from playwright.async_api import async_playwright
 
           URL = "https://www.hurtigruten.com/en/port-to-port"
-
           TARGET_DATE = "2027-02-07"
 
           ROUTES = [
@@ -46,704 +43,558 @@ jobs:
               ("Bodø", "Tromsø"),
           ]
 
+          logs = []
 
-          def visible(locator):
-              try:
-                  return locator.is_visible()
-              except Exception:
-                  return False
+          def redact(text):
+              if not text:
+                  return ""
+              text = str(text)
 
-
-          def remove_cookie_overlay(page):
-              selectors = [
-                  "#onetrust-accept-btn-handler",
-                  "#onetrust-reject-all-handler",
-                  "button:has-text('Accept all')",
-                  "button:has-text('Reject all')",
-              ]
-
-              for selector in selectors:
-                  try:
-                      loc = page.locator(selector)
-
-                      for i in range(loc.count()):
-                          item = loc.nth(i)
-
-                          if visible(item):
-                              item.click(
-                                  force=True,
-                                  timeout=3000
-                              )
-                              time.sleep(1)
-                              return
-                  except Exception:
-                      pass
-
-              try:
-                  page.locator(
-                      ".onetrust-pc-dark-filter"
-                  ).evaluate_all(
-                      "(els) => els.forEach(e => e.remove())"
-                  )
-              except Exception:
-                  pass
-
-
-          def all_frames(page):
-              return [page] + [
-                  frame for frame in page.frames
-                  if frame != page
-              ]
-
-
-          def find_port_input(page, port_type):
-              if port_type == "from":
-                  selectors = [
-                      'input[placeholder*="Sail from" i]',
-                      'input[aria-label*="Sail from" i]',
-                  ]
-              else:
-                  selectors = [
-                      'input[placeholder*="Sail to" i]',
-                      'input[aria-label*="Sail to" i]',
-                  ]
-
-              for frame in all_frames(page):
-                  for selector in selectors:
-                      try:
-                          loc = frame.locator(selector)
-
-                          for i in range(loc.count()):
-                              item = loc.nth(i)
-
-                              if visible(item):
-                                  return frame, item
-                      except Exception:
-                          pass
-
-              return None, None
-
-
-          def select_port(page, port, port_type):
-              frame, inp = find_port_input(
-                  page,
-                  port_type
+              text = re.sub(
+                  r'([?&](?:auth|token|access_token|refresh_token|code|session)=)[^&\s]+',
+                  r'\1[REDACTED]',
+                  text,
+                  flags=re.I,
               )
 
-              if inp is None:
-                  raise RuntimeError(
-                      f"Cannot find {port_type} port input"
-                  )
-
-              print(
-                  f"SELECTING {port_type.upper()}: {port}"
+              text = re.sub(
+                  r'("?(?:authorization|cookie|set-cookie|auth|token|access_token|refresh_token)"?\s*[:=]\s*)[^,\s}]+',
+                  r'\1[REDACTED]',
+                  text,
+                  flags=re.I,
               )
 
-              inp.click(force=True)
-              inp.fill("")
-              inp.type(
-                  port,
-                  delay=80
-              )
+              return text[:3000]
 
-              time.sleep(2)
+          def add(msg):
+              print(msg)
+              logs.append(msg)
 
-              selectors = [
-                  '[role="option"]:visible',
-                  'li:visible',
-              ]
+          async def remove_cookie_overlay(page):
+              await page.evaluate("""
+              () => {
+                  document.querySelectorAll(
+                      '.onetrust-pc-dark-filter,' +
+                      '#onetrust-banner-sdk,' +
+                      '#onetrust-consent-sdk'
+                  ).forEach(e => e.remove());
 
-              for selector in selectors:
-                  try:
-                      options = frame.locator(selector)
-
-                      for i in range(options.count()):
-                          option = options.nth(i)
-
-                          if not visible(option):
-                              continue
-
-                          try:
-                              text = option.inner_text().strip()
-                          except Exception:
-                              continue
-
-                          if port.lower() in text.lower():
-                              print(
-                                  "CLICKING OPTION:",
-                                  text
-                              )
-
-                              option.click(
-                                  force=True
-                              )
-
-                              time.sleep(2)
-
-                              return
-                  except Exception:
-                      pass
-
-              try:
-                  inp.press("ArrowDown")
-                  inp.press("Enter")
-                  time.sleep(2)
-                  return
-              except Exception:
-                  pass
-
-              raise RuntimeError(
-                  f"Could not select port: {port}"
-              )
-
-
-          def dump_dom(page):
-              print("\n========== DOM DUMP ==========\n")
-
-              for frame_number, frame in enumerate(
-                  all_frames(page)
-              ):
-                  print(
-                      f"\n===== FRAME {frame_number} =====\n"
-                  )
-
-                  try:
-                      html = frame.locator(
-                          "body"
-                      ).inner_text(
-                          timeout=5000
-                      )
-
-                      print(
-                          html[:30000]
-                      )
-                  except Exception as e:
-                      print(
-                          "BODY ERROR:",
-                          repr(e)
-                      )
-
-                  try:
-                      forms = frame.locator("form")
-
-                      print(
-                          "\nFORMS:",
-                          forms.count()
-                      )
-
-                      for i in range(
-                          min(forms.count(), 10)
-                      ):
-                          try:
-                              html = forms.nth(i).evaluate(
-                                  "(e) => e.outerHTML"
-                              )
-
-                              print(
-                                  f"\nFORM {i}:\n"
-                              )
-
-                              print(
-                                  html[:20000]
-                              )
-                          except Exception:
-                              pass
-                  except Exception:
-                      pass
-
-                  try:
-                      inputs = frame.locator(
-                          "input"
-                      )
-
-                      print(
-                          "\nINPUTS:",
-                          inputs.count()
-                      )
-
-                      for i in range(
-                          min(inputs.count(), 100)
-                      ):
-                          try:
-                              html = inputs.nth(i).evaluate(
-                                  "(e) => e.outerHTML"
-                              )
-
-                              print(
-                                  f"\nINPUT {i}:\n"
-                              )
-
-                              print(
-                                  html[:5000]
-                              )
-                          except Exception:
-                              pass
-
-                  except Exception:
-                      pass
-
-                  try:
-                      buttons = frame.locator(
-                          "button"
-                      )
-
-                      print(
-                          "\nBUTTONS:",
-                          buttons.count()
-                      )
-
-                      for i in range(
-                          min(buttons.count(), 100)
-                      ):
-                          try:
-                              html = buttons.nth(i).evaluate(
-                                  "(e) => e.outerHTML"
-                              )
-
-                              print(
-                                  f"\nBUTTON {i}:\n"
-                              )
-
-                              print(
-                                  html[:5000]
-                              )
-                          except Exception:
-                              pass
-
-                  except Exception:
-                      pass
-
-
-          def install_network_logging(page):
-              requests = []
-              responses = []
-
-              def on_request(request):
-                  try:
-                      resource_type = request.resource_type
-
-                      if resource_type in [
-                          "xhr",
-                          "fetch",
-                      ]:
-                          item = {
-                              "type": "request",
-                              "method": request.method,
-                              "url": request.url,
-                              "post_data": request.post_data,
-                          }
-
-                          requests.append(item)
-
-                          print(
-                              "\n>>> REQUEST"
-                          )
-
-                          print(
-                              json.dumps(
-                                  item,
-                                  ensure_ascii=False,
-                                  indent=2
-                              )
-                          )
-
-                  except Exception:
-                      pass
-
-
-              def on_response(response):
-                  try:
-                      request = response.request
-
-                      if request.resource_type not in [
-                          "xhr",
-                          "fetch",
-                      ]:
-                          return
-
-                      item = {
-                          "type": "response",
-                          "status": response.status,
-                          "url": response.url,
-                      }
-
-                      responses.append(item)
-
-                      print(
-                          "\n<<< RESPONSE"
-                      )
-
-                      print(
-                          json.dumps(
-                              item,
-                              ensure_ascii=False,
-                              indent=2
-                          )
-                      )
-
-                      try:
-                          text = response.text()
-
-                          if text:
-                              safe_name = re.sub(
-                                  r"[^A-Za-z0-9_.-]+",
-                                  "_",
-                                  response.url
-                              )[:150]
-
-                              Path(
-                                  "responses"
-                              ).mkdir(
-                                  exist_ok=True
-                              )
-
-                              with open(
-                                  "responses/"
-                                  + safe_name
-                                  + ".txt",
-                                  "w",
-                                  encoding="utf-8"
-                              ) as f:
-                                  f.write(text[:500000])
-                      except Exception:
-                          pass
-
-                  except Exception:
-                      pass
-
-
-              page.on(
-                  "request",
-                  on_request
-              )
-
-              page.on(
-                  "response",
-                  on_response
-              )
-
-              return requests, responses
-
-
-          def dump_requests(
-              requests,
-              responses
-          ):
-              data = {
-                  "requests": requests,
-                  "responses": responses,
+                  document.body.style.overflow = 'auto';
               }
+              """)
 
-              with open(
-                  "network.json",
-                  "w",
-                  encoding="utf-8"
-              ) as f:
-                  json.dump(
-                      data,
-                      f,
-                      ensure_ascii=False,
-                      indent=2
+          async def visible_inputs(page):
+              return await page.locator("input").evaluate_all("""
+              els => els
+                .filter(e => {
+                  const r = e.getBoundingClientRect();
+                  return r.width > 0 && r.height > 0 &&
+                         getComputedStyle(e).visibility !== 'hidden' &&
+                         getComputedStyle(e).display !== 'none';
+                })
+                .map(e => ({
+                  type:e.type,
+                  name:e.name,
+                  id:e.id,
+                  value:e.value,
+                  placeholder:e.placeholder,
+                  aria:e.getAttribute('aria-label'),
+                  outer:e.outerHTML.slice(0,1500)
+                }))
+              """)
+
+          async def buttons(page):
+              return await page.locator("button").evaluate_all("""
+              els => els
+                .filter(e => {
+                  const r = e.getBoundingClientRect();
+                  return r.width > 0 && r.height > 0 &&
+                         getComputedStyle(e).visibility !== 'hidden' &&
+                         getComputedStyle(e).display !== 'none';
+                })
+                .map(e => ({
+                  text:(e.innerText || '').trim(),
+                  aria:e.getAttribute('aria-label'),
+                  type:e.type,
+                  name:e.name,
+                  value:e.value,
+                  outer:e.outerHTML.slice(0,1200)
+                }))
+              """)
+
+          async def forms(page):
+              return await page.locator("form").evaluate_all("""
+              els => els.map(e => ({
+                action:e.action,
+                method:e.method,
+                outer:e.outerHTML.slice(0,6000)
+              }))
+              """)
+
+          async def select_port(page, value):
+              inputs = page.locator("input")
+              count = await inputs.count()
+
+              for i in range(count):
+                  el = inputs.nth(i)
+
+                  try:
+                      if not await el.is_visible():
+                          continue
+
+                      current = await el.input_value()
+
+                      # Port inputs are text inputs containing a current port.
+                      if current and current.strip():
+                          await el.click()
+                          await el.press("Control+A")
+                          await el.fill(value)
+                          await page.wait_for_timeout(500)
+
+                          # Select matching visible option.
+                          option = page.get_by_text(value, exact=True)
+                          if await option.count():
+                              for j in range(await option.count()):
+                                  try:
+                                      if await option.nth(j).is_visible():
+                                          await option.nth(j).click()
+                                          await page.wait_for_timeout(500)
+                                          return True
+                                  except:
+                                      pass
+
+                          await el.press("Enter")
+                          await page.wait_for_timeout(300)
+                          return True
+
+                  except:
+                      pass
+
+              return False
+
+          async def inspect_page(page, label):
+              add("")
+              add("===== " + label + " =====")
+              add("URL: " + page.url)
+
+              try:
+                  ins = await visible_inputs(page)
+                  add("VISIBLE INPUTS:")
+                  add(json.dumps(ins, ensure_ascii=False, indent=2)[:12000])
+              except Exception as e:
+                  add("INPUT ERROR: " + repr(e))
+
+              try:
+                  btn = await buttons(page)
+                  add("VISIBLE BUTTONS:")
+                  add(json.dumps(btn, ensure_ascii=False, indent=2)[:16000])
+              except Exception as e:
+                  add("BUTTON ERROR: " + repr(e))
+
+              try:
+                  frm = await forms(page)
+                  add("FORMS:")
+                  add(json.dumps(frm, ensure_ascii=False, indent=2)[:12000])
+              except Exception as e:
+                  add("FORM ERROR: " + repr(e))
+
+          async def set_date(page):
+              add("")
+              add("===== DATE SEARCH =====")
+
+              data = await page.locator("input").evaluate_all("""
+              els => els.map((e,i) => {
+                const r=e.getBoundingClientRect();
+                return {
+                  i,
+                  type:e.type,
+                  value:e.value,
+                  name:e.name,
+                  id:e.id,
+                  placeholder:e.placeholder,
+                  aria:e.getAttribute('aria-label'),
+                  visible:r.width>0 && r.height>0 &&
+                    getComputedStyle(e).visibility!=='hidden' &&
+                    getComputedStyle(e).display!=='none',
+                  outer:e.outerHTML.slice(0,2000)
+                }
+              })
+              """)
+
+              add(json.dumps(data, ensure_ascii=False, indent=2)[:18000])
+
+              # Try every visible date-like input.
+              for item in data:
+                  if not item["visible"]:
+                      continue
+
+                  typ = (item["type"] or "").lower()
+                  name = (item["name"] or "").lower()
+                  ident = (item["id"] or "").lower()
+                  placeholder = (item["placeholder"] or "").lower()
+                  value = (item["value"] or "").lower()
+
+                  candidate = (
+                      typ == "date"
+                      or "date" in name
+                      or "date" in ident
+                      or "date" in placeholder
+                      or "/" in value
+                      or "-" in value
                   )
 
+                  if not candidate:
+                      continue
 
-          def try_cabin_button(page):
-              names = [
+                  el = page.locator("input").nth(item["i"])
+
+                  try:
+                      await el.click()
+                      await page.wait_for_timeout(300)
+
+                      # Try direct fill first.
+                      try:
+                          await el.fill(TARGET_DATE)
+                          add("DATE fill succeeded: " + item["outer"])
+                          return True
+                      except Exception as e:
+                          add("DATE fill failed: " + repr(e))
+
+                      # Try keyboard.
+                      try:
+                          await el.press("Control+A")
+                          await el.type("02/07/2027")
+                          await el.press("Tab")
+                          add("DATE keyboard attempt succeeded")
+                          return True
+                      except Exception as e:
+                          add("DATE keyboard failed: " + repr(e))
+
+                  except Exception as e:
+                      add("DATE candidate failed: " + repr(e))
+
+              return False
+
+          async def try_submit(page):
+              add("")
+              add("===== SUBMIT ATTEMPTS =====")
+
+              # 1. Native submit buttons.
+              candidates = page.locator(
+                  'button[type="submit"], '
+                  'input[type="submit"], '
+                  'button[data-testid*="submit"], '
+                  'button[data-testid*="search"], '
+                  'button[aria-label*="search" i]'
+              )
+
+              count = await candidates.count()
+              add(f"SUBMIT CANDIDATES: {count}")
+
+              for i in range(count):
+                  el = candidates.nth(i)
+                  try:
+                      if await el.is_visible():
+                          add("CLICK SUBMIT: " + await el.evaluate(
+                              "(e)=>e.outerHTML.slice(0,2000)"
+                          ))
+                          await el.click()
+                          await page.wait_for_timeout(4000)
+                          add("URL AFTER SUBMIT: " + page.url)
+                          return True
+                  except Exception as e:
+                      add("SUBMIT CLICK ERROR: " + repr(e))
+
+              # 2. Cabin choice buttons.
+              texts = [
                   "I do not want to book a cabin",
                   "I want to book a cabin",
               ]
 
-              for name in names:
-                  for frame in all_frames(page):
+              for text in texts:
+                  loc = page.get_by_text(text, exact=True)
+                  count = await loc.count()
+
+                  for i in range(count):
+                      el = loc.nth(i)
+
                       try:
-                          buttons = frame.get_by_role(
-                              "button",
-                              name=re.compile(
-                                  re.escape(name),
-                                  re.I
+                          if await el.is_visible():
+                              add("CLICK CABIN: " + text)
+                              await el.click()
+                              await page.wait_for_timeout(5000)
+                              add("URL AFTER CABIN: " + page.url)
+
+                              await inspect_page(
+                                  page,
+                                  "AFTER CABIN: " + text
                               )
-                          )
 
-                          for i in range(
-                              buttons.count()
-                          ):
-                              button = buttons.nth(i)
+                              return True
+                      except Exception as e:
+                          add("CABIN CLICK ERROR: " + repr(e))
 
-                              if visible(button):
-                                  print(
-                                      "\nCLICKING CABIN BUTTON:",
-                                      name
-                                  )
+              # 3. Press Enter on the visible port/date form.
+              try:
+                  forms = page.locator("form")
+                  fc = await forms.count()
 
-                                  button.click(
-                                      force=True
-                                  )
+                  for i in range(fc):
+                      f = forms.nth(i)
 
-                                  time.sleep(5)
-
-                                  return True
-                      except Exception:
-                          pass
+                      if await f.is_visible():
+                          add("TRY FORM ENTER")
+                          await f.press("Enter")
+                          await page.wait_for_timeout(5000)
+                          add("URL AFTER FORM ENTER: " + page.url)
+                          return True
+              except Exception as e:
+                  add("FORM ENTER ERROR: " + repr(e))
 
               return False
 
+          async def check_route(page, origin, destination):
+              label = f"{origin} -> {destination}"
+              add("")
+              add("########################################")
+              add(label)
+              add("########################################")
 
-          def inspect_date(page):
-              print(
-                  "\n========== DATE INSPECTION ==========\n"
-              )
+              await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+              await page.wait_for_timeout(3000)
 
-              for frame_number, frame in enumerate(
-                  all_frames(page)
-              ):
+              await remove_cookie_overlay(page)
+
+              add("INITIAL URL: " + page.url)
+
+              # Find visible text inputs and use first two suitable port fields.
+              inputs = page.locator("input")
+              count = await inputs.count()
+
+              port_indices = []
+
+              for i in range(count):
+                  el = inputs.nth(i)
                   try:
-                      inputs = frame.locator(
-                          "input"
-                      )
+                      if not await el.is_visible():
+                          continue
 
-                      for i in range(
-                          inputs.count()
-                      ):
-                          item = inputs.nth(i)
+                      typ = (await el.get_attribute("type") or "").lower()
+                      if typ not in ("text", "search", ""):
+                          continue
 
-                          try:
-                              if not visible(item):
-                                  continue
-
-                              value = item.input_value()
-
-                              outer = item.evaluate(
-                                  "(e) => e.outerHTML"
-                              )
-
-                              if (
-                                  re.search(
-                                      r"\\d{1,2}/\\d{1,2}/\\d{4}",
-                                      value or ""
-                                  )
-                                  or
-                                  "date" in (
-                                      item.get_attribute(
-                                          "type"
-                                      ) or ""
-                                  ).lower()
-                              ):
-                                  print(
-                                      f"\nFRAME {frame_number}"
-                                  )
-
-                                  print(
-                                      "VALUE:",
-                                      value
-                                  )
-
-                                  print(
-                                      "OUTERHTML:"
-                                  )
-
-                                  print(
-                                      outer
-                                  )
-
-                                  try:
-                                      parent = item.evaluate(
-                                          "(e) => e.parentElement.outerHTML"
-                                      )
-
-                                      print(
-                                          "\nPARENT HTML:"
-                                      )
-
-                                      print(
-                                          parent[:15000]
-                                      )
-                                  except Exception:
-                                      pass
-
-                          except Exception:
-                              pass
-
-                  except Exception:
+                      port_indices.append(i)
+                  except:
                       pass
 
+              add("VISIBLE TEXT INPUT INDICES: " + str(port_indices))
 
-          def check_route(
-              page,
-              from_port,
-              to_port
-          ):
-              print(
-                  "\n\n======================================"
-              )
+              # Use current values to distinguish the two port fields.
+              if len(port_indices) >= 2:
+                  try:
+                      a = inputs.nth(port_indices[0])
+                      b = inputs.nth(port_indices[1])
 
-              print(
-                  f"ROUTE: {from_port} -> {to_port}"
-              )
+                      await a.click()
+                      await a.press("Control+A")
+                      await a.fill(origin)
+                      await page.wait_for_timeout(500)
 
-              print(
-                  "======================================\n"
-              )
+                      opt = page.get_by_text(origin, exact=True)
+                      for j in range(await opt.count()):
+                          if await opt.nth(j).is_visible():
+                              await opt.nth(j).click()
+                              break
 
-              page.goto(
-                  URL,
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
+                      await page.wait_for_timeout(300)
 
-              page.wait_for_timeout(7000)
+                      await b.click()
+                      await b.press("Control+A")
+                      await b.fill(destination)
+                      await page.wait_for_timeout(500)
 
-              remove_cookie_overlay(page)
+                      opt = page.get_by_text(destination, exact=True)
+                      for j in range(await opt.count()):
+                          if await opt.nth(j).is_visible():
+                              await opt.nth(j).click()
+                              break
 
-              select_port(
-                  page,
-                  from_port,
-                  "from"
-              )
+                      await page.wait_for_timeout(500)
 
-              select_port(
-                  page,
-                  to_port,
-                  "to"
-              )
+                  except Exception as e:
+                      add("PORT SELECTION ERROR: " + repr(e))
 
-              print(
-                  "\nPORTS SELECTED:"
-              )
+              await inspect_page(page, "AFTER PORT SELECTION " + label)
 
-              print(
-                  from_port,
-                  "->",
-                  to_port
-              )
+              date_ok = await set_date(page)
+              add("DATE RESULT: " + str(date_ok))
 
-              inspect_date(page)
+              await remove_cookie_overlay(page)
 
-              dump_dom(page)
+              await inspect_page(page, "BEFORE SUBMIT " + label)
 
-              try_cabin_button(page)
+              await try_submit(page)
 
-              page.wait_for_timeout(5000)
+              await page.wait_for_timeout(5000)
 
-              print(
-                  "\nCURRENT URL:"
-              )
+              add("FINAL URL: " + page.url)
 
-              print(
-                  page.url
-              )
+              try:
+                  await page.screenshot(
+                      path=f"final_{origin}_{destination}.png",
+                      full_page=True
+                  )
+              except:
+                  pass
 
-              inspect_date(page)
+              try:
+                  with open(
+                      f"html_{origin}_{destination}.html",
+                      "w",
+                      encoding="utf-8"
+                  ) as f:
+                      f.write(await page.content())
+              except:
+                  pass
 
-              dump_dom(page)
-
-
-          def main():
-              with sync_playwright() as p:
-
-                  browser = p.chromium.launch(
-                      headless=True
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(
+                      headless=True,
+                      args=[
+                          "--disable-blink-features=AutomationControlled",
+                      ],
                   )
 
-                  context = browser.new_context(
-                      viewport={
-                          "width": 1440,
-                          "height": 1200
-                      },
+                  context = await browser.new_context(
+                      viewport={"width":1440, "height":1200},
                       locale="en-GB",
-                      timezone_id="Europe/Oslo"
+                      timezone_id="Europe/Oslo",
                   )
 
-                  page = context.new_page()
+                  page = await context.new_page()
 
-                  requests, responses = (
-                      install_network_logging(page)
-                  )
+                  async def on_request(req):
+                      if req.resource_type in ("xhr", "fetch"):
+                          u = req.url
 
-                  for from_port, to_port in ROUTES:
-                      try:
-                          check_route(
-                              page,
-                              from_port,
-                              to_port
-                          )
+                          # Keep only potentially useful requests.
+                          if any(x in u.lower() for x in [
+                              "hurtigruten",
+                              "booking",
+                              "availability",
+                              "voyage",
+                              "sailing",
+                              "search",
+                              "api",
+                              "salesforce",
+                          ]):
+                              post = redact(req.post_data or "")
 
-                      except Exception as e:
-                          print(
-                              "\nROUTE ERROR:"
-                          )
-
-                          print(
-                              type(e).__name__
-                              + ": "
-                              + str(e)
-                          )
-
-                          try:
-                              page.screenshot(
-                                  path=(
-                                      "error_"
-                                      + from_port.replace(
-                                          " ",
-                                          "_"
-                                      )
-                                      + "_"
-                                      + to_port.replace(
-                                          " ",
-                                          "_"
-                                      )
-                                      + ".png"
-                                  ),
-                                  full_page=True
+                              add(
+                                  "REQUEST "
+                                  + req.method
+                                  + " "
+                                  + redact(u)
+                                  + (
+                                      "\nPOST="
+                                      + post
+                                      if post else ""
+                                  )
                               )
-                          except Exception:
-                              pass
 
-                  dump_requests(
-                      requests,
-                      responses
-                  )
+                  async def on_response(resp):
+                      if resp.request.resource_type in ("xhr", "fetch"):
+                          u = resp.url
 
-                  try:
-                      page.screenshot(
-                          path="final.png",
-                          full_page=True
-                      )
-                  except Exception:
-                      pass
+                          if any(x in u.lower() for x in [
+                              "hurtigruten",
+                              "booking",
+                              "availability",
+                              "voyage",
+                              "sailing",
+                              "search",
+                              "api",
+                              "salesforce",
+                          ]):
+                              add(
+                                  "RESPONSE "
+                                  + str(resp.status)
+                                  + " "
+                                  + redact(u)
+                              )
 
-                  try:
-                      with open(
-                          "final.html",
-                          "w",
-                          encoding="utf-8"
-                      ) as f:
-                          f.write(
-                              page.content()
+                  page.on("request", on_request)
+                  page.on("response", on_response)
+
+                  for origin, destination in ROUTES:
+                      try:
+                          await check_route(page, origin, destination)
+                      except Exception as e:
+                          add(
+                              f"ROUTE ERROR {origin}->{destination}: "
+                              + repr(e)
                           )
-                  except Exception:
-                      pass
 
-                  browser.close()
+                  await browser.close()
 
+              with open("diagnostic.txt", "w", encoding="utf-8") as f:
+                  f.write("\n".join(logs))
 
           if __name__ == "__main__":
-              main()
+              asyncio.run(main())
           PY
 
-      - name: Run diagnostic monitor
+      - name: Run diagnostic
         run: |
           python monitor.py
 
-      - name: Upload diagnostics
+      - name: Send diagnostic email
         if: always()
-        uses: actions/upload-artifact@v6
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python - <<'PY'
+          import os
+          import smtplib
+          from email.mime.text import MIMEText
+
+          user = os.environ["SMTP_USER"]
+          password = os.environ["SMTP_PASSWORD"]
+          to = os.environ["ALERT_EMAIL"]
+
+          try:
+              with open("diagnostic.txt", "r", encoding="utf-8") as f:
+                  text = f.read()
+          except Exception as e:
+              text = "Unable to read diagnostic.txt: " + repr(e)
+
+          # Keep the email manageable.
+          if len(text) > 50000:
+              text = text[-50000:]
+
+          msg = MIMEText(text, "plain", "utf-8")
+          msg["Subject"] = "Hurtigruten Action Diagnostic"
+          msg["From"] = user
+          msg["To"] = to
+
+          with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as smtp:
+              smtp.login(user, password)
+              smtp.sendmail(user, [to], msg.as_string())
+
+          print("Diagnostic email sent.")
+          PY
+
+      - name: Upload diagnostic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: hurtigruten-network-diagnostics
+          name: hurtigruten-action-diagnostic
           path: |
-            network.json
-            final.html
-            final.png
-            error_*.png
+            diagnostic.txt
+            *.png
+            *.html
             monitor.py
-            responses/
           if-no-files-found: ignore
