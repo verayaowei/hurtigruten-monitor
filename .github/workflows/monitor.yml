@@ -55,7 +55,7 @@ jobs:
               msg["From"] = SMTP_USER
               msg["To"] = ALERT_EMAIL
 
-              with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as server:
+              with smtplib.SMTP_SSL("smtp.qq.com", 465) as server:
                   server.login(SMTP_USER, SMTP_PASSWORD)
                   server.sendmail(
                       SMTP_USER,
@@ -65,40 +65,45 @@ jobs:
 
 
           def close_cookie_popup(page):
-              selectors = [
+              for selector in [
                   "#onetrust-accept-btn-handler",
                   "#onetrust-reject-all-handler",
                   "button:has-text('Accept all')",
                   "button:has-text('Reject all')",
-              ]
-
-              for selector in selectors:
+              ]:
                   try:
                       loc = page.locator(selector)
+
                       for i in range(loc.count()):
                           x = loc.nth(i)
+
                           if x.is_visible():
-                              x.click(force=True, timeout=2000)
-                              time.sleep(0.5)
-                              return
+                              x.click(
+                                  force=True,
+                                  timeout=2000
+                              )
+                              break
                   except:
                       pass
 
               try:
-                  page.locator(".onetrust-pc-dark-filter").evaluate_all(
-                      "(els) => els.forEach(e => e.remove())"
+                  page.locator(
+                      ".onetrust-pc-dark-filter"
+                  ).evaluate_all(
+                      "(x) => x.forEach(e => e.remove())"
                   )
               except:
                   pass
 
 
-          def all_frames(page):
+          def get_frames(page):
               return [page] + [
-                  f for f in page.frames if f != page
+                  f for f in page.frames
+                  if f != page
               ]
 
 
-          def find_port_input(page, field):
+          def find_port(page, field):
               if field == "from":
                   selectors = [
                       'input[placeholder="Sail from where?"]',
@@ -112,7 +117,7 @@ jobs:
                       'input[aria-label*="Sail to" i]',
                   ]
 
-              for frame in all_frames(page):
+              for frame in get_frames(page):
                   for selector in selectors:
                       try:
                           loc = frame.locator(selector)
@@ -131,11 +136,11 @@ jobs:
           def select_port(page, port, field):
               close_cookie_popup(page)
 
-              frame, inp = find_port_input(page, field)
+              frame, inp = find_port(page, field)
 
               if inp is None:
                   raise RuntimeError(
-                      f"Cannot find {field} port input: {port}"
+                      f"Cannot find {field} port input"
                   )
 
               inp.click(force=True)
@@ -147,21 +152,20 @@ jobs:
               for selector in [
                   '[role="option"]:visible',
                   'li:visible',
-                  '[data-testid*="option" i]:visible',
               ]:
                   try:
-                      loc = frame.locator(selector)
+                      options = frame.locator(selector)
 
-                      for i in range(loc.count()):
-                          x = loc.nth(i)
+                      for i in range(options.count()):
+                          option = options.nth(i)
 
-                          if not x.is_visible():
+                          if not option.is_visible():
                               continue
 
-                          text = x.inner_text().strip()
+                          text = option.inner_text().strip()
 
                           if port.lower() in text.lower():
-                              x.click(force=True)
+                              option.click(force=True)
                               time.sleep(1)
                               return
                   except:
@@ -173,184 +177,215 @@ jobs:
 
 
           def find_date_input(page):
-              # The diagnostic file showed the real date field
-              # as an INPUT whose current value was 06/09/2026.
-              selectors = [
-                  'input[type="date"]',
-                  'input[value="06/09/2026"]',
-                  'input[placeholder*="date" i]',
-                  'input[aria-label*="date" i]',
-              ]
+              # Do NOT use value="06/09/2026".
+              #
+              # The diagnostic showed that the date field is
+              # the input immediately after the roundtrip/oneway
+              # controls.
+              #
+              # We therefore inspect visible inputs and identify
+              # the input whose value looks like a localized date.
 
-              for frame in all_frames(page):
-                  for selector in selectors:
-                      try:
-                          loc = frame.locator(selector)
-
-                          for i in range(loc.count()):
-                              x = loc.nth(i)
-
-                              if x.is_visible():
-                                  return frame, x
-                      except:
-                          pass
-
-              # Last resort: identify the visible input whose
-              # value looks like a date.
-              for frame in all_frames(page):
+              for frame in get_frames(page):
                   try:
                       inputs = frame.locator("input:visible")
+
+                      candidates = []
 
                       for i in range(inputs.count()):
                           x = inputs.nth(i)
 
-                          value = x.input_value()
+                          try:
+                              value = x.input_value()
+                              typ = (
+                                  x.get_attribute("type")
+                                  or ""
+                              ).lower()
 
+                              candidates.append(
+                                  (i, x, value, typ)
+                              )
+                          except:
+                              pass
+
+                      # First: date-looking value.
+                      for i, x, value, typ in candidates:
                           if re.match(
                               r"^\d{1,2}/\d{1,2}/\d{4}$",
                               value
                           ):
                               return frame, x
+
+                      # Second: native date input.
+                      for i, x, value, typ in candidates:
+                          if typ == "date":
+                              return frame, x
+
                   except:
                       pass
 
               return None, None
 
 
-          def set_target_date(page):
+          def set_date(page):
               frame, date_input = find_date_input(page)
 
               if date_input is None:
                   raise RuntimeError(
-                      "Cannot find departure date input"
+                      "Departure date input not found"
                   )
 
-              # Native date input.
-              try:
-                  date_input.fill("2027-02-07")
-              except:
-                  # Text date input.
-                  date_input.click(force=True)
-                  date_input.press("Control+A")
-                  date_input.type("07/02/2027")
-              
+              old_value = date_input.input_value()
+
+              print(
+                  "DATE INPUT FOUND:",
+                  old_value
+              )
+
+              # The actual field is a custom date field.
+              # Try keyboard editing first.
+              date_input.click(force=True)
+
+              date_input.press("Control+A")
+              date_input.press("Backspace")
+
+              # Localized format used by the page.
+              date_input.type(
+                  "07/02/2027",
+                  delay=80
+              )
+
               date_input.press("Tab")
+
               time.sleep(1)
 
-              value = date_input.input_value()
+              new_value = date_input.input_value()
 
-              print("DATE FIELD VALUE:", value)
+              print(
+                  "DATE AFTER INPUT:",
+                  new_value
+              )
 
-              # Accept both native ISO and localized format.
-              if (
-                  "2027-02-07" not in value
-                  and "07/02/2027" not in value
-                  and "7/2/2027" not in value
-              ):
+              # If direct typing did not work, open the picker
+              # and navigate through keyboard.
+              if "2027" not in new_value:
+                  date_input.click(force=True)
+
+                  # Try Home/End based keyboard navigation.
+                  date_input.press("Control+A")
+                  date_input.type(
+                      "07/02/2027",
+                      delay=100
+                  )
+                  date_input.press("Enter")
+                  date_input.press("Tab")
+
+                  time.sleep(1)
+
+                  new_value = date_input.input_value()
+
+              if "2027" not in new_value:
                   raise RuntimeError(
-                      f"Failed to set target date. "
-                      f"Actual value: {value}"
+                      "Could not set target date. "
+                      f"Current value: {new_value}"
                   )
 
 
-          def choose_no_cabin(page):
-              for frame in all_frames(page):
-                  selectors = [
-                      "button:has-text('I do not want to book a cabin')",
-                      "text=I do not want to book a cabin",
-                  ]
+          def click_no_cabin(page):
+              for frame in get_frames(page):
+                  try:
+                      buttons = frame.get_by_role(
+                          "button",
+                          name=re.compile(
+                              "I do not want to book a cabin",
+                              re.I
+                          )
+                      )
 
-                  for selector in selectors:
-                      try:
-                          loc = frame.locator(selector)
+                      for i in range(buttons.count()):
+                          b = buttons.nth(i)
 
-                          for i in range(loc.count()):
-                              x = loc.nth(i)
-
-                              if x.is_visible():
-                                  x.click(force=True)
-                                  time.sleep(1)
-                                  return True
-                      except:
-                          pass
+                          if b.is_visible():
+                              b.click(force=True)
+                              time.sleep(1)
+                              return True
+                  except:
+                      pass
 
               return False
 
 
-          def find_form(page):
-              for frame in all_frames(page):
+          def submit(page):
+              # Do not search for "Search".
+              #
+              # Submit the actual form.
+              for frame in get_frames(page):
                   try:
                       forms = frame.locator("form")
 
                       for i in range(forms.count()):
                           form = forms.nth(i)
 
-                          if form.is_visible():
-                              return frame, form
+                          if not form.is_visible():
+                              continue
+
+                          try:
+                              form.evaluate(
+                                  "(f) => f.requestSubmit()"
+                              )
+                          except:
+                              try:
+                                  form.locator(
+                                      "button[type=submit]"
+                                  ).first.click(
+                                      force=True
+                                  )
+                              except:
+                                  pass
+
+                          time.sleep(8)
+                          return
+
                   except:
                       pass
 
-              return None, None
+              # Fallback: Enter from the date field.
+              frame, date_input = find_date_input(page)
+
+              if date_input is not None:
+                  date_input.press("Enter")
+                  time.sleep(8)
+                  return
+
+              raise RuntimeError(
+                  "Unable to submit booking form"
+              )
 
 
-          def submit_form(page):
-              frame, form = find_form(page)
+          def read_text(page):
+              result = []
 
-              if form is None:
-                  # Try Enter from the date field.
-                  _, date_input = find_date_input(page)
-
-                  if date_input is not None:
-                      date_input.press("Enter")
-                      time.sleep(6)
-                      return
-
-                  raise RuntimeError(
-                      "Cannot find booking form"
-                  )
-
-              # Submit the actual HTML form rather than guessing
-              # the button text.
-              try:
-                  form.evaluate(
-                      "(f) => f.requestSubmit()"
-                  )
-              except:
+              for frame in get_frames(page):
                   try:
-                      form.locator(
-                          'button[type="submit"], input[type="submit"]'
-                      ).first.click(force=True)
-                  except:
-                      date_input = find_date_input(page)[1]
-
-                      if date_input is None:
-                          raise RuntimeError(
-                              "Cannot submit booking form"
-                          )
-
-                      date_input.press("Enter")
-
-              time.sleep(8)
-
-
-          def collect_page_text(page):
-              text = []
-
-              for frame in all_frames(page):
-                  try:
-                      text.append(
-                          frame.locator("body").inner_text(
+                      result.append(
+                          frame.locator(
+                              "body"
+                          ).inner_text(
                               timeout=5000
                           )
                       )
                   except:
                       pass
 
-              return "\n".join(text)
+              return "\n".join(result)
 
 
-          def target_date_in_text(text):
-              normalized = re.sub(r"\s+", " ", text).lower()
+          def has_target_date(text):
+              t = re.sub(
+                  r"\s+",
+                  " ",
+                  text
+              ).lower()
 
               patterns = [
                   "07/02/2027",
@@ -366,46 +401,15 @@ jobs:
               ]
 
               return any(
-                  p.lower() in normalized
-                  for p in patterns
+                  x.lower() in t
+                  for x in patterns
               )
 
 
-          def availability_words(text):
-              t = text.lower()
-
-              positive = [
-                  "available",
-                  "book now",
-                  "select sailing",
-                  "select departure",
-                  "departure",
-                  "sailing",
-              ]
-
-              negative = [
-                  "sold out",
-                  "fully booked",
-                  "no availability",
-                  "not available",
-                  "unavailable",
-              ]
-
-              has_positive = any(
-                  x in t for x in positive
-              )
-
-              has_negative = any(
-                  x in t for x in negative
-              )
-
-              return has_positive and not has_negative
-
-
-          def save_diagnostic(page, name):
+          def save(page, name):
               try:
                   page.screenshot(
-                      path=f"{name}.png",
+                      path=name + ".png",
                       full_page=True
                   )
               except:
@@ -413,7 +417,7 @@ jobs:
 
               try:
                   with open(
-                      f"{name}.html",
+                      name + ".html",
                       "w",
                       encoding="utf-8"
                   ) as f:
@@ -422,7 +426,7 @@ jobs:
                   pass
 
 
-          def check_route(page, from_port, to_port):
+          def check(page, from_port, to_port):
               page.goto(
                   URL,
                   wait_until="domcontentloaded",
@@ -430,6 +434,7 @@ jobs:
               )
 
               page.wait_for_timeout(5000)
+
               close_cookie_popup(page)
 
               select_port(
@@ -445,47 +450,42 @@ jobs:
               )
 
               print(
-                  f"PORTS OK: {from_port} -> {to_port}"
+                  "PORTS SELECTED:",
+                  from_port,
+                  to_port
               )
 
-              set_target_date(page)
+              set_date(page)
 
               print(
-                  f"DATE OK: {TARGET_DATE}"
+                  "DATE SELECTED:",
+                  TARGET_DATE
               )
 
-              choose_no_cabin(page)
+              click_no_cabin(page)
 
-              submit_form(page)
+              submit(page)
 
               print(
                   "RESULT URL:",
                   page.url
               )
 
-              text = collect_page_text(page)
+              time.sleep(3)
 
-              safe = (
+              text = read_text(page)
+
+              name = (
                   from_port.replace(" ", "_")
                   + "_"
                   + to_port.replace(" ", "_")
               )
 
-              save_diagnostic(
-                  page,
-                  safe
-              )
+              save(page, name)
 
-              print(
-                  "RESULT TEXT:",
-                  text[:10000]
-              )
-
-              # Strict target-date requirement.
-              if target_date_in_text(text):
+              if has_target_date(text):
                   return True
 
-              # Also accept the target date in the resulting URL.
               if TARGET_DATE in page.url:
                   return True
 
@@ -497,6 +497,7 @@ jobs:
               errors = []
 
               with sync_playwright() as p:
+
                   browser = p.chromium.launch(
                       headless=True
                   )
@@ -513,6 +514,7 @@ jobs:
                   page = context.new_page()
 
                   for from_port, to_port in ROUTES:
+
                       route = (
                           f"{from_port} -> {to_port}"
                       )
@@ -523,68 +525,41 @@ jobs:
                               route
                           )
 
-                          found = check_route(
+                          if check(
                               page,
                               from_port,
                               to_port
-                          )
-
-                          if found:
+                          ):
                               available.append(route)
-                              print(
-                                  "TARGET DATE FOUND:",
-                                  route
-                              )
-                          else:
-                              print(
-                                  "NO CONFIRMED TARGET DATE:",
-                                  route
-                              )
 
                       except Exception as e:
-                          error = (
-                              f"{type(e).__name__}: {e}"
-                          )
-
-                          print(
-                              "ERROR:",
-                              route,
-                              error
-                          )
-
                           errors.append(
-                              f"{route}\n{error}"
+                              route
+                              + "\n"
+                              + type(e).__name__
+                              + ": "
+                              + str(e)
                           )
 
                   browser.close()
 
               if available:
-                  body = (
+                  send_email(
+                      "Hurtigruten AVAILABLE",
                       "Hurtigruten availability detected\n\n"
                       f"Target date: {TARGET_DATE}\n\n"
                       + "\n".join(
                           "AVAILABLE: " + x
                           for x in available
                       )
-                      + "\n\n"
-                      "Please check Hurtigruten immediately."
-                  )
-
-                  send_email(
-                      "Hurtigruten AVAILABLE",
-                      body
                   )
 
               if errors:
-                  body = (
+                  send_email(
+                      "Hurtigruten monitor ERROR",
                       "Hurtigruten monitor ERROR\n\n"
                       f"Target date: {TARGET_DATE}\n\n"
                       + "\n\n".join(errors)
-                  )
-
-                  send_email(
-                      "Hurtigruten monitor ERROR",
-                      body
                   )
 
               print("MONITOR FINISHED")
