@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
+permissions:
+  contents: write
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
@@ -26,788 +29,335 @@ jobs:
       - name: Create monitor
         run: |
           cat > monitor.py <<'PY'
-          from playwright.sync_api import sync_playwright
-          from datetime import datetime
+          import base64
+          import json
           import os
           import re
-          import json
-          import time
-
-          URL = "https://www.hurtigruten.com/en/port-to-port"
-
-          ROUTES = [
-              ("Svolvær", "Skjervøy"),
-              ("Svolvær", "Tromsø"),
-              ("Bodø", "Tromsø"),
-          ]
+          import subprocess
+          from datetime import datetime, timezone, timedelta
+          from playwright.sync_api import sync_playwright
 
           TARGET_DATE = "2027-02-07"
 
-          # Possible date representations used by websites.
-          DATE_VARIANTS = [
-              "2027-02-07",
-              "07/02/2027",
-              "7/2/2027",
-              "07.02.2027",
-              "7.2.2027",
-              "07 Feb 2027",
-              "7 Feb 2027",
-              "07 February 2027",
-              "7 February 2027",
-              "February 7, 2027",
+          ROUTES = [
+              ("Svolvær", "SVJ", "Skjervøy", "SRY"),
+              ("Svolvær", "SVJ", "Tromsø", "TOS"),
+              ("Bodø", "BOO", "Tromsø", "TOS"),
           ]
 
+          BOOKING_URL = "https://www.hurtigruten.com/en/port-to-port/booking"
 
-          def log(message):
+          STATE_FILE = "monitor_state.json"
+
+          def log(msg):
               print(
-                  f"[{datetime.utcnow().isoformat()}] {message}",
+                  f"[{datetime.now(timezone.utc).isoformat()}] {msg}",
                   flush=True
               )
 
+          def make_search_url(from_code, to_code):
+              data = {
+                  "locale": "en",
+                  "searchUnit": "day",
+                  "startDate": TARGET_DATE + "T00:00:00.000Z",
+                  "endDate": TARGET_DATE + "T23:59:59.000Z",
+                  "promotionCode": None,
+                  "fromPort": from_code,
+                  "toPort": to_code,
+                  "vehicles": {
+                      "cars": 0,
+                      "motorcycles": 0
+                  },
+                  "cabins": [{
+                      "adults": 1,
+                      "children": 0,
+                      "infants": 0,
+                      "companions": 0,
+                      "students": 0,
+                      "seniors": 0,
+                      "militaryServicePersons": 0,
+                      "wheelchairs": 0,
+                      "pets": 0
+                  }],
+                  "travelType": "deckspace",
+                  "voyageSlug": "",
+                  "isRoundtrip": False,
+                  "isDeckSpace": True
+              }
 
-          def safe_name(text):
-              return re.sub(
-                  r"[^A-Za-z0-9_-]+",
-                  "_",
-                  text
-              )
+              raw = json.dumps(
+                  data,
+                  separators=(",", ":"),
+                  ensure_ascii=False
+              ).encode("utf-8")
 
+              encoded = base64.urlsafe_b64encode(raw).decode("ascii")
 
-          def screenshot(page, name):
+              return BOOKING_URL + "?searchData=" + encoded
+
+          def load_state():
+              if not os.path.exists(STATE_FILE):
+                  return {}
+
               try:
-                  page.screenshot(
-                      path=f"{safe_name(name)}.png",
-                      full_page=True
-                  )
-              except Exception as e:
-                  log(f"Screenshot failed: {e}")
+                  with open(STATE_FILE, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
 
-
-          def visible_inputs(page):
-              result = []
-
-              for i in range(page.locator("input").count()):
-                  try:
-                      el = page.locator("input").nth(i)
-
-                      if el.is_visible():
-                          result.append(el)
-                  except Exception:
-                      pass
-
-              return result
-
-
-          def port_inputs(page):
-              result = []
-
-              for el in visible_inputs(page):
-                  try:
-                      typ = (
-                          el.get_attribute("type")
-                          or ""
-                      ).lower()
-
-                      if typ in (
-                          "hidden",
-                          "radio",
-                          "checkbox",
-                          "date"
-                      ):
-                          continue
-
-                      placeholder = (
-                          el.get_attribute("placeholder")
-                          or ""
-                      ).lower()
-
-                      aria = (
-                          el.get_attribute("aria-label")
-                          or ""
-                      ).lower()
-
-                      value = el.input_value().strip()
-
-                      # Ignore global site search.
-                      if (
-                          "search for anything"
-                          in placeholder
-                          or value.lower()
-                          == "search for anything"
-                      ):
-                          continue
-
-                      if (
-                          typ in ("text", "search", "")
-                          or "port" in placeholder
-                          or "port" in aria
-                      ):
-                          result.append(el)
-
-                  except Exception:
-                      pass
-
-              return result
-
-
-          def select_port(page, port, index):
-              fields = port_inputs(page)
-
-              log(
-                  f"Port fields detected: {len(fields)}"
-              )
-
-              if len(fields) < 2:
-                  raise RuntimeError(
-                      "Could not locate the two Port fields."
+          def save_state(state):
+              with open(STATE_FILE, "w", encoding="utf-8") as f:
+                  json.dump(
+                      state,
+                      f,
+                      ensure_ascii=False,
+                      indent=2
                   )
 
-              field = fields[index]
+          def normalize(text):
+              return re.sub(r"\s+", " ", text).strip()
 
-              log(
-                  f"Setting "
-                  f"{'FROM' if index == 0 else 'TO'} "
-                  f"= {port}"
-              )
+          def find_target_date(text):
+              patterns = [
+                  r"07[./-]02[./-]2027",
+                  r"2027[./-]02[./-]07",
+                  r"Feb(?:ruary)?\s+7(?:,|\s+)2027",
+                  r"7\s+Feb(?:ruary)?\s+2027",
+              ]
 
-              field.click()
-              field.fill("")
-
-              field.fill(port)
-
-              page.wait_for_timeout(1200)
-
-              # Exact text result.
-              exact = page.get_by_text(
-                  port,
-                  exact=True
-              )
-
-              for i in range(
-                  exact.count() - 1,
-                  -1,
-                  -1
-              ):
-                  try:
-                      item = exact.nth(i)
-
-                      if item.is_visible():
-                          item.click()
-                          page.wait_for_timeout(700)
-
-                          log(
-                              f"Selected {port}"
-                          )
-
-                          return
-                  except Exception:
-                      pass
-
-              # role=option fallback.
-              options = page.locator(
-                  '[role="option"]'
-              )
-
-              for i in range(options.count()):
-                  try:
-                      item = options.nth(i)
-
-                      if not item.is_visible():
-                          continue
-
-                      text = item.inner_text().strip()
-
-                      if port.lower() in text.lower():
-                          item.click()
-                          page.wait_for_timeout(700)
-
-                          log(
-                              f"Selected option {text}"
-                          )
-
-                          return
-                  except Exception:
-                      pass
-
-              # li fallback.
-              options = page.locator("li")
-
-              for i in range(options.count()):
-                  try:
-                      item = options.nth(i)
-
-                      if not item.is_visible():
-                          continue
-
-                      text = item.inner_text().strip()
-
-                      if text.lower() == port.lower():
-                          item.click()
-                          page.wait_for_timeout(700)
-
-                          log(
-                              f"Selected list item {text}"
-                          )
-
-                          return
-                  except Exception:
-                      pass
-
-              raise RuntimeError(
-                  f"Could not select port: {port}"
-              )
-
-
-          def set_target_date(page):
-              log(
-                  f"Setting target date {TARGET_DATE}"
-              )
-
-              fields = visible_inputs()
-
-              # First choice: native date input.
-              for el in fields:
-                  try:
-                      typ = (
-                          el.get_attribute("type")
-                          or ""
-                      ).lower()
-
-                      if typ != "date":
-                          continue
-
-                      if not el.is_enabled():
-                          continue
-
-                      try:
-                          el.fill(TARGET_DATE)
-                      except Exception:
-                          page.evaluate(
-                              """([el, value]) => {
-                                  const setter =
-                                    Object.getOwnPropertyDescriptor(
-                                      HTMLInputElement.prototype,
-                                      "value"
-                                    ).set;
-                                  setter.call(el, value);
-                                  el.dispatchEvent(
-                                    new Event(
-                                      "input",
-                                      {bubbles:true}
-                                    )
-                                  );
-                                  el.dispatchEvent(
-                                    new Event(
-                                      "change",
-                                      {bubbles:true}
-                                    )
-                                  );
-                              }""",
-                              [el, TARGET_DATE]
-                          )
-
-                      log(
-                          "Native date input updated."
-                      )
-
+              for pattern in patterns:
+                  if re.search(pattern, text, re.I):
                       return True
-
-                  except Exception:
-                      pass
-
-              # Second choice: date-looking value.
-              for el in fields:
-                  try:
-                      typ = (
-                          el.get_attribute("type")
-                          or ""
-                      ).lower()
-
-                      if typ in (
-                          "hidden",
-                          "radio",
-                          "checkbox"
-                      ):
-                          continue
-
-                      value = el.input_value().strip()
-
-                      if re.fullmatch(
-                          r"\d{1,2}/\d{1,2}/\d{4}",
-                          value
-                      ):
-                          log(
-                              f"Found date field: {value}"
-                          )
-
-                          try:
-                              el.fill(TARGET_DATE)
-                          except Exception:
-                              page.evaluate(
-                                  """([el, value]) => {
-                                      const setter =
-                                        Object.getOwnPropertyDescriptor(
-                                          HTMLInputElement.prototype,
-                                          "value"
-                                        ).set;
-                                      setter.call(el, value);
-                                      el.dispatchEvent(
-                                        new Event(
-                                          "input",
-                                          {bubbles:true}
-                                        )
-                                      );
-                                      el.dispatchEvent(
-                                        new Event(
-                                          "change",
-                                          {bubbles:true}
-                                        )
-                                      );
-                                  }""",
-                                  [el, TARGET_DATE]
-                              )
-
-                          return True
-
-                  except Exception:
-                      pass
-
-              log(
-                  "Date field could not be identified."
-              )
 
               return False
 
+          def extract_prices(text):
+              patterns = [
+                  r"(?:€|EUR|NOK|£|GBP|\$|USD)\s?[\d,.]+",
+                  r"[\d,.]+\s?(?:EUR|NOK|GBP|USD)"
+              ]
 
-          def click_no_cabin(page):
-              pattern = re.compile(
-                  r"I do not want to book a cabin",
-                  re.I
-              )
+              found = []
 
-              buttons = page.get_by_role(
-                  "button",
-                  name=pattern
-              )
+              for pattern in patterns:
+                  found.extend(re.findall(pattern, text, re.I))
 
-              for i in range(buttons.count()):
-                  try:
-                      button = buttons.nth(i)
+              result = []
+              seen = set()
 
-                      if (
-                          button.is_visible()
-                          and button.is_enabled()
-                      ):
-                          log(
-                              "Clicking "
-                              "'I do not want to book a cabin'"
-                          )
+              for item in found:
+                  item = normalize(item)
+                  if item not in seen:
+                      seen.add(item)
+                      result.append(item)
 
-                          button.click()
+              return result[:20]
 
-                          return
-                  except Exception:
-                      pass
+          def inspect_page(page, route):
+              text = page.locator("body").inner_text(timeout=60000)
+              text = normalize(text)
 
-              # Text fallback.
-              for i in range(
-                  page.locator("button").count()
-              ):
-                  try:
-                      button = (
-                          page.locator("button").nth(i)
-                      )
-
-                      if not button.is_visible():
-                          continue
-
-                      text = (
-                          button.inner_text()
-                          .strip()
-                      )
-
-                      if re.search(
-                          r"I do not want to book a cabin",
-                          text,
-                          re.I
-                      ):
-                          button.click()
-                          return
-
-                  except Exception:
-                      pass
-
-              raise RuntimeError(
-                  "Cabin selection button not found."
-              )
-
-
-          def date_present(text):
               lower = text.lower()
 
-              return any(
-                  value.lower() in lower
-                  for value in DATE_VARIANTS
-              )
+              log("")
+              log("=" * 80)
+              log(f"RESULT: {route[0]} -> {route[2]}")
+              log(f"URL: {page.url}")
+              log(f"TITLE: {page.title()}")
+              log("=" * 80)
 
+              print(text[:50000])
 
-          def contains_route(text, route):
-              lower = text.lower()
+              has_target_date = find_target_date(text)
+              prices = extract_prices(text)
 
-              return (
-                  route[0].lower() in lower
-                  and route[1].lower() in lower
-              )
-
-
-          def availability_signal(text):
-              lower = text.lower()
-
-              negative = [
+              no_result_words = [
                   "no availability",
                   "no voyages",
                   "no sailings",
                   "no results",
-                  "nothing found",
                   "not available",
                   "sold out",
-                  "fully booked"
+                  "nothing found"
               ]
 
-              positive = [
-                  "available",
-                  "availability",
+              positive_words = [
                   "departure",
                   "sailing",
                   "voyage",
+                  "available",
                   "price",
-                  "nok",
-                  "eur",
-                  "gbp",
-                  "usd"
+                  "select departure"
               ]
 
-              negative_hits = [
-                  x for x in negative
+              negatives = [
+                  x for x in no_result_words
                   if x in lower
               ]
 
-              positive_hits = [
-                  x for x in positive
+              positives = [
+                  x for x in positive_words
                   if x in lower
               ]
 
-              price = bool(
-                  re.search(
-                      r"(€|EUR|NOK|£|GBP|\$|USD)\s?\d",
-                      text,
-                      re.I
+              log(f"Target date detected: {has_target_date}")
+              log(f"Positive terms: {positives}")
+              log(f"Negative terms: {negatives}")
+              log(f"Prices: {prices}")
+
+              # 必须确认目标日期出现。
+              if not has_target_date:
+                  return {
+                      "available": False,
+                      "fingerprint": None,
+                      "text": text[:12000]
+                  }
+
+              # 明确显示无结果，则认为没有票。
+              if negatives:
+                  return {
+                      "available": False,
+                      "fingerprint": None,
+                      "text": text[:12000]
+                  }
+
+              # 有价格 + 航次相关内容，才认为可能有可售航次。
+              if prices and len(positives) >= 2:
+                  fingerprint_source = (
+                      route[1] + "|" +
+                      route[3] + "|" +
+                      TARGET_DATE + "|" +
+                      "|".join(prices)
                   )
-                  or
-                  re.search(
-                      r"\d[\d,.]*\s?"
-                      r"(EUR|NOK|GBP|USD)",
-                      text,
-                      re.I
-                  )
-              )
 
-              return (
-                  not negative_hits
-                  and (
-                      price
-                      or len(positive_hits) >= 3
-                  )
-              )
+                  fingerprint = base64.b64encode(
+                      fingerprint_source.encode()
+                  ).decode()
 
+                  return {
+                      "available": True,
+                      "fingerprint": fingerprint,
+                      "prices": prices,
+                      "text": text[:12000]
+                  }
 
-          def inspect(page, route):
-              try:
-                  text = page.locator(
-                      "body"
-                  ).inner_text(
-                      timeout=30000
-                  )
-              except Exception:
-                  text = ""
-
-              log(
-                  "----- FINAL PAGE -----"
-              )
-
-              log(
-                  f"URL: {page.url}"
-              )
-
-              log(
-                  f"Target date present: "
-                  f"{date_present(text)}"
-              )
-
-              log(
-                  f"Route present: "
-                  f"{contains_route(text, route)}"
-              )
-
-              potential = (
-                  date_present(text)
-                  and availability_signal(text)
-              )
-
-              log(
-                  f"Availability signal: "
-                  f"{potential}"
-              )
-
-              print(text[:50000])
-
-              screenshot(
-                  page,
-                  "result_"
-                  + route[0]
-                  + "_"
-                  + route[1]
-              )
-
-              return potential
-
+              return {
+                  "available": False,
+                  "fingerprint": None,
+                  "text": text[:12000]
+              }
 
           def check_route(browser, route):
+              from_name, from_code, to_name, to_code = route
+
+              url = make_search_url(from_code, to_code)
+
+              log("")
+              log("#" * 80)
+              log(f"CHECKING {from_name} -> {to_name}")
+              log(f"FROM CODE: {from_code}")
+              log(f"TO CODE:   {to_code}")
+              log(f"URL: {url}")
+              log("#" * 80)
+
               context = browser.new_context(
-                  viewport={
-                      "width": 1440,
-                      "height": 1000
-                  },
+                  viewport={"width": 1440, "height": 1000},
                   locale="en-GB",
                   timezone_id="Europe/Oslo"
               )
 
               page = context.new_page()
 
-              interesting_requests = []
-
-              def request_handler(request):
-                  url = request.url.lower()
-
-                  if any(
-                      key in url
-                      for key in (
-                          "booking",
-                          "availability",
-                          "voyage",
-                          "sailing",
-                          "search",
-                          "graphql",
-                          "api"
-                      )
-                  ):
-                      interesting_requests.append(
-                          {
-                              "method": request.method,
-                              "url": request.url
-                          }
-                      )
-
-                      log(
-                          "REQUEST "
-                          + request.method
-                          + " "
-                          + request.url[:1000]
-                      )
-
-              page.on(
-                  "request",
-                  request_handler
-              )
-
               try:
-                  log("")
-                  log("=" * 70)
-                  log(
-                      f"CHECKING "
-                      f"{route[0]} -> {route[1]}"
-                  )
-                  log("=" * 70)
-
                   page.goto(
-                      URL,
+                      url,
                       wait_until="domcontentloaded",
                       timeout=120000
                   )
 
-                  page.wait_for_timeout(10000)
-
-                  # Cookie banner.
-                  try:
-                      page.locator(
-                          "#onetrust-accept-btn-handler"
-                      ).click(
-                          timeout=3000
-                      )
-
-                      page.wait_for_timeout(1000)
-
-                  except Exception:
-                      pass
-
-                  screenshot(
-                      page,
-                      "before_"
-                      + route[0]
-                      + "_"
-                      + route[1]
-                  )
-
-                  # IMPORTANT:
-                  # This operates on the real page DOM.
-                  # No iframe is used.
-                  select_port(
-                      page,
-                      route[0],
-                      0
-                  )
-
-                  select_port(
-                      page,
-                      route[1],
-                      1
-                  )
-
-                  page.wait_for_timeout(1000)
-
-                  set_target_date(page)
-
-                  page.wait_for_timeout(1000)
-
-                  old_url = page.url
-
-                  click_no_cabin(page)
-
-                  log(
-                      "Cabin choice submitted."
-                  )
-
-                  # Allow frontend state, navigation and API
-                  # calls to complete.
                   page.wait_for_timeout(12000)
 
-                  try:
-                      page.wait_for_load_state(
-                          "networkidle",
-                          timeout=20000
-                      )
-                  except Exception:
-                      pass
-
-                  page.wait_for_timeout(5000)
-
-                  log(
-                      f"URL after submission: "
-                      f"{page.url}"
-                  )
-
-                  # Inspect page.
-                  potential = inspect(
-                      page,
-                      route
-                  )
-
-                  # Save useful request information.
-                  try:
-                      with open(
-                          "network_requests.txt",
-                          "a",
-                          encoding="utf-8"
-                      ) as f:
-                          f.write(
-                              "\n"
-                              + "=" * 80
-                              + "\n"
-                              + f"{route[0]} -> {route[1]}"
-                              + "\n"
-                          )
-
-                          for item in (
-                              interesting_requests
-                          ):
-                              f.write(
-                                  item["method"]
-                                  + " "
-                                  + item["url"]
-                                  + "\n"
-                              )
-
-                  except Exception:
-                      pass
+                  result = inspect_page(page, route)
 
                   return {
                       "route": route,
-                      "potential": potential,
-                      "url": page.url
+                      "url": page.url,
+                      **result
                   }
 
               except Exception as e:
                   log(
-                      f"ERROR "
-                      f"{route[0]} -> {route[1]}: "
+                      f"Route check failed: "
                       f"{type(e).__name__}: {e}"
-                  )
-
-                  screenshot(
-                      page,
-                      "ERROR_"
-                      + route[0]
-                      + "_"
-                      + route[1]
                   )
 
                   return {
                       "route": route,
-                      "potential": False,
-                      "error": str(e),
-                      "url": page.url
+                      "url": page.url,
+                      "available": False,
+                      "fingerprint": None,
+                      "error": str(e)
                   }
 
               finally:
                   context.close()
 
-
           def main():
-              log(
-                  "Starting Hurtigruten monitor"
-              )
+              log("Starting Hurtigruten monitor")
+              log(f"Target date: {TARGET_DATE}")
 
-              log(
-                  f"Target date: {TARGET_DATE}"
-              )
-
-              found = []
-
-              # Remove old diagnostic request file.
-              try:
-                  os.remove(
-                      "network_requests.txt"
-                  )
-              except FileNotFoundError:
-                  pass
+              state = load_state()
+              alerts = []
 
               with sync_playwright() as p:
-                  browser = p.chromium.launch(
-                      headless=True
-                  )
+                  browser = p.chromium.launch(headless=True)
 
                   for route in ROUTES:
-                      result = check_route(
-                          browser,
-                          route
+                      result = check_route(browser, route)
+
+                      key = (
+                          route[1] +
+                          "_" +
+                          route[3] +
+                          "_" +
+                          TARGET_DATE
                       )
 
-                      if result.get("potential"):
-                          found.append(result)
+                      old = state.get(key)
+
+                      if result.get("available"):
+                          fingerprint = result.get("fingerprint")
+
+                          log(
+                              f"AVAILABLE: "
+                              f"{route[0]} -> {route[2]}"
+                          )
+
+                          if not old or old.get("fingerprint") != fingerprint:
+                              alerts.append(result)
+
+                          state[key] = {
+                              "fingerprint": fingerprint,
+                              "last_seen": datetime.now(
+                                  timezone.utc
+                              ).isoformat()
+                          }
+
+                      else:
+                          log(
+                              f"No availability: "
+                              f"{route[0]} -> {route[2]}"
+                          )
+
+                          # 航次消失后清除状态。
+                          # 下一次重新出现时重新报警。
+                          state.pop(key, None)
 
                   browser.close()
 
-              if found:
+              save_state(state)
+
+              if alerts:
                   with open(
                       "availability_found.txt",
                       "w",
@@ -815,37 +365,48 @@ jobs:
                   ) as f:
 
                       f.write(
-                          "Hurtigruten availability alert\n"
+                          "Hurtigruten Port-to-Port availability alert\n"
                       )
-
                       f.write(
-                          f"Target date: "
-                          f"{TARGET_DATE}\n\n"
+                          f"Target date: {TARGET_DATE}\n\n"
                       )
 
-                      for result in found:
-                          route = result["route"]
+                      for item in alerts:
+                          route = item["route"]
 
                           f.write(
                               f"Route: "
-                              f"{route[0]} -> "
-                              f"{route[1]}\n"
+                              f"{route[0]} -> {route[2]}\n"
                           )
 
                           f.write(
-                              f"Booking page: "
-                              f"{result.get('url', '')}\n\n"
+                              f"From code: {route[1]}\n"
+                          )
+
+                          f.write(
+                              f"To code: {route[3]}\n"
+                          )
+
+                          f.write(
+                              "Prices: "
+                              + ", ".join(
+                                  item.get("prices", [])
+                              )
+                              + "\n"
+                          )
+
+                          f.write(
+                              f"Booking URL:\n"
+                              f"{item['url']}\n\n"
                           )
 
                   log(
-                      f"FOUND {len(found)} route(s)."
+                      f"NEW availability found: "
+                      f"{len(alerts)} route(s)"
                   )
 
               else:
-                  log(
-                      "No availability detected."
-                  )
-
+                  log("No NEW availability.")
 
           if __name__ == "__main__":
               main()
@@ -892,12 +453,15 @@ jobs:
           message["From"] = user
           message["To"] = recipient
 
+          print(
+              f"Sending alert to {recipient}"
+          )
+
           with smtplib.SMTP_SSL(
               "smtp.qq.com",
               465,
               timeout=30
           ) as smtp:
-
               smtp.login(
                   user,
                   password
@@ -914,13 +478,27 @@ jobs:
           )
           PY
 
+      - name: Save monitor state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -f monitor_state.json ]; then
+            git add monitor_state.json
+
+            if ! git diff --cached --quiet; then
+              git commit -m "Update Hurtigruten monitor state"
+              git push
+            fi
+          fi
+
       - name: Save diagnostics
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: hurtigruten-diagnostics
           path: |
-            *.png
             availability_found.txt
-            network_requests.txt
+            monitor_state.json
           if-no-files-found: ignore
