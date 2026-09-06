@@ -36,10 +36,8 @@ jobs:
           from email.mime.multipart import MIMEMultipart
           from playwright.sync_api import sync_playwright
 
-          HOME = "https://www.hurtigruten.com/en/port-to-port"
-          BOOKING = "https://www.hurtigruten.com/en/port-to-port/booking"
-
-          TARGET = "2027-02-07"
+          URL = "https://www.hurtigruten.com/en/port-to-port"
+          TARGET_DATE = "2027-02-07"
 
           ROUTES = [
               ("Svolvær", "Skjervøy", "svolvaer-skjer"),
@@ -59,402 +57,84 @@ jobs:
               msg["Subject"] = subject
               msg.attach(MIMEText(body, "plain", "utf-8"))
 
-              ctx = ssl.create_default_context()
-
               with smtplib.SMTP_SSL(
                   "smtp.qq.com",
                   465,
-                  context=ctx,
+                  context=ssl.create_default_context(),
                   timeout=30
-              ) as s:
-                  s.login(SMTP_USER, SMTP_PASSWORD)
-                  s.sendmail(
+              ) as server:
+                  server.login(SMTP_USER, SMTP_PASSWORD)
+                  server.sendmail(
                       SMTP_USER,
                       [ALERT_EMAIL],
                       msg.as_string()
                   )
 
 
-          def norm(s):
-              return re.sub(r"\s+", " ", s or "").strip()
+          def clean(text):
+              return re.sub(r"\s+", " ", text or "").strip()
 
 
-          def choose_port(page, port, field):
-              print(f"Selecting {field}: {port}")
+          def close_cookie_popup(page):
+              """
+              Hurtigruten uses OneTrust.
+              The overlay:
+              onetrust-pc-dark-filter
+              can intercept all pointer events.
+              """
 
-              if field == "from":
-                  selectors = [
-                      'input[placeholder="Sail from where?"]',
-                      'input[placeholder*="Sail from"]',
-                  ]
-              else:
-                  selectors = [
-                      'input[placeholder="Sail to where?"]',
-                      'input[placeholder*="Sail to"]',
-                  ]
+              print("Checking cookie popup...")
 
-              box = None
+              # Accept/reject buttons used by OneTrust.
+              selectors = [
+                  "#onetrust-accept-btn-handler",
+                  "#onetrust-reject-all-handler",
+                  "button#onetrust-accept-btn-handler",
+                  "button#onetrust-reject-all-handler",
+              ]
 
               for selector in selectors:
                   try:
-                      x = page.locator(selector).first
-                      if x.is_visible():
-                          box = x
-                          break
-                  except:
-                      pass
+                      button = page.locator(selector).first
 
-              if box is None:
-                  inputs = page.locator("input:visible")
-                  if inputs.count() < 2:
-                      raise RuntimeError(
-                          f"找不到 {field} 输入框"
-                      )
-
-                  box = inputs.nth(
-                      0 if field == "from" else 1
-                  )
-
-              box.click()
-              box.fill("")
-              box.type(port, delay=80)
-
-              page.wait_for_timeout(2000)
-
-              # 只从真正的 autocomplete option 中选择
-              options = page.locator(
-                  '[role="option"]:visible'
-              )
-
-              for i in range(options.count()):
-                  try:
-                      option = options.nth(i)
-                      text = norm(option.inner_text())
-
-                      print(
-                          f"{field} option {i}: {text}"
-                      )
-
-                      if port.casefold() in text.casefold():
-                          option.click()
-                          page.wait_for_timeout(1000)
-                          return
-                  except:
-                      pass
-
-              # fallback：查找包含港口名称的列表项
-              items = page.locator(
-                  'li:visible'
-              )
-
-              for i in range(items.count()):
-                  try:
-                      item = items.nth(i)
-                      text = norm(item.inner_text())
-
-                      if port.casefold() in text.casefold():
-                          item.click()
-                          page.wait_for_timeout(1000)
-                          return
-                  except:
-                      pass
-
-              raise RuntimeError(
-                  f"找不到港口: {port}"
-              )
-
-
-          def submit(page):
-              print("Submitting search")
-
-              # 只寻找真正 submit 元素
-              buttons = page.locator(
-                  'button[type="submit"]:visible'
-              )
-
-              for i in range(buttons.count()):
-                  try:
-                      b = buttons.nth(i)
-
-                      if b.is_enabled():
+                      if button.is_visible(timeout=2000):
                           print(
-                              "Submit button:",
-                              norm(b.inner_text())
+                              f"Cookie button found: {selector}"
                           )
-                          b.click()
-                          page.wait_for_timeout(6000)
+
+                          button.click(
+                              force=True,
+                              timeout=10000
+                          )
+
+                          page.wait_for_timeout(1500)
+                          print("Cookie popup closed.")
                           return
-                  except:
+                  except Exception:
                       pass
 
-              # 如果网站没有 type=submit，
-              # 从 To 输入框 Enter
-              tobox = page.locator(
-                  'input[placeholder*="Sail to"]:visible'
-              ).first
+              # Sometimes the popup has already been handled
+              # but the overlay remains for a short time.
+              try:
+                  page.locator(
+                      "#onetrust-pc-sdk"
+                  ).evaluate(
+                      "(e) => e.remove()"
+                  )
+              except Exception:
+                  pass
 
-              if tobox.count():
-                  tobox.press("Enter")
-                  page.wait_for_timeout(6000)
-                  return
+              try:
+                  page.locator(
+                      "#onetrust-consent-sdk"
+                  ).evaluate(
+                      """
+                      (e) => {
+                          e.style.pointerEvents = 'none';
+                      }
+                      """
+                  )
+              except Exception:
+                  pass
 
-              raise RuntimeError(
-                  "无法提交 Port-to-Port 查询"
-              )
-
-
-          def collect(page):
-              body = page.locator(
-                  "body"
-              ).inner_text(timeout=15000)
-
-              url = page.url
-
-              print("CURRENT URL:")
-              print(url)
-
-              print("PAGE TEXT:")
-              print(body[:25000])
-
-              return url, body
-
-
-          def date_found(body):
-              b = body.casefold()
-
-              patterns = [
-                  "7 february 2027",
-                  "07 february 2027",
-                  "february 7, 2027",
-                  "feb 7, 2027",
-                  "07/02/2027",
-                  "7/2/2027",
-                  "2027-02-07",
-                  "07.02.2027",
-              ]
-
-              return any(
-                  x in b
-                  for x in patterns
-              )
-
-
-          def availability_found(body):
-              b = body.casefold()
-
-              bad = [
-                  "sold out",
-                  "fully booked",
-                  "no availability",
-                  "not available",
-                  "unavailable",
-                  "no departures",
-                  "no results",
-              ]
-
-              if any(x in b for x in bad):
-                  return False
-
-              good = [
-                  "book now",
-                  "available",
-                  "availability",
-                  "cabin",
-                  "deck space",
-                  "price",
-                  "€",
-                  "nok",
-              ]
-
-              return any(
-                  x in b
-                  for x in good
-              )
-
-
-          def check(page, origin, destination, rid):
-              print()
-              print("=" * 70)
-              print(
-                  f"CHECKING {origin} -> {destination}"
-              )
-              print("=" * 70)
-
-              page.goto(
-                  HOME,
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
-
-              page.wait_for_timeout(6000)
-
-              choose_port(
-                  page,
-                  origin,
-                  "from"
-              )
-
-              choose_port(
-                  page,
-                  destination,
-                  "to"
-              )
-
-              submit(page)
-
-              page.wait_for_timeout(8000)
-
-              url, body = collect(page)
-
-              page.screenshot(
-                  path=f"{rid}.png",
-                  full_page=True
-              )
-
-              found_date = date_found(body)
-              found_availability = (
-                  found_date
-                  and availability_found(body)
-              )
-
-              print(
-                  f"DATE={found_date} "
-                  f"AVAILABLE={found_availability}"
-              )
-
-              return (
-                  found_availability,
-                  found_date,
-                  url,
-                  body
-              )
-
-
-          results = []
-          errors = []
-          found = []
-
-          with sync_playwright() as p:
-
-              browser = p.chromium.launch(
-                  headless=True
-              )
-
-              context = browser.new_context(
-                  viewport={
-                      "width": 1440,
-                      "height": 1000
-                  },
-                  locale="en-US",
-                  timezone_id="Europe/Oslo"
-              )
-
-              page = context.new_page()
-
-              for origin, destination, rid in ROUTES:
-
-                  try:
-                      available, target_date_found, url, body = check(
-                          page,
-                          origin,
-                          destination,
-                          rid
-                      )
-
-                      results.append(
-                          f"{origin} -> {destination}: "
-                          f"target_date={target_date_found}, "
-                          f"available={available}"
-                      )
-
-                      if available:
-                          found.append(
-                              f"{origin} -> {destination}"
-                          )
-
-                  except Exception as e:
-
-                      print(traceback.format_exc())
-
-                      errors.append(
-                          f"{origin} -> {destination}: "
-                          f"{type(e).__name__}: {e}"
-                      )
-
-                      try:
-                          page.screenshot(
-                              path=f"{rid}-ERROR.png",
-                              full_page=True
-                          )
-                      except:
-                          pass
-
-              browser.close()
-
-
-          # 有票才通知
-          if found:
-
-              body = (
-                  "Hurtigruten availability found!\n\n"
-                  f"Target date: {TARGET}\n\n"
-                  + "\n".join(found)
-                  + "\n\n"
-                  "Booking:\n"
-                  + BOOKING
-              )
-
-              send_mail(
-                  "Hurtigruten - AVAILABLE",
-                  body
-              )
-
-
-          # 程序真正报错才通知
-          if errors:
-
-              body = (
-                  "Hurtigruten monitor ERROR\n\n"
-                  f"Target date: {TARGET}\n\n"
-                  + "\n".join(errors)
-                  + "\n\nRESULTS:\n"
-                  + "\n".join(results)
-              )
-
-              send_mail(
-                  "Hurtigruten Monitor ERROR",
-                  body
-              )
-
-
-          print()
-          print("=" * 70)
-          print("FINAL")
-          print("=" * 70)
-
-          for x in results:
-              print(x)
-
-          if errors:
-              print("ERRORS:")
-              for x in errors:
-                  print(x)
-          PY
-
-      - name: Run monitor
-        env:
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
-        run: |
-          python monitor.py
-
-      - name: Upload diagnostics
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: hurtigruten-diagnostics
-          path: |
-            *.png
-            monitor.py
-          if-no-files-found: ignore
+              try:
