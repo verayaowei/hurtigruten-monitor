@@ -27,17 +27,16 @@ jobs:
       - name: Create monitor
         run: |
           cat > monitor.py <<'PY'
+          from playwright.sync_api import sync_playwright
+          from datetime import datetime
           import os
           import re
           import ssl
           import smtplib
-          import traceback
           from email.mime.text import MIMEText
           from email.mime.multipart import MIMEMultipart
-          from playwright.sync_api import sync_playwright
 
           URL = "https://www.hurtigruten.com/en/port-to-port"
-          TARGET_DATE = "2027-02-07"
 
           ROUTES = [
               ("Svolvær", "Skjervøy", "svolvaer-skjer"),
@@ -45,25 +44,55 @@ jobs:
               ("Bodø", "Tromsø", "bodo-tromso"),
           ]
 
+          TARGET_DATE = "2027-02-07"
+
           SMTP_USER = os.environ["SMTP_USER"]
           SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
           ALERT_EMAIL = os.environ["ALERT_EMAIL"]
 
 
-          def send_mail(subject, body):
+          def log(message):
+              print(
+                  f"[{datetime.utcnow().isoformat()}] {message}",
+                  flush=True
+              )
+
+
+          def safe_name(text):
+              return re.sub(
+                  r"[^A-Za-z0-9_-]+",
+                  "_",
+                  text
+              )
+
+
+          def send_email(subject, body):
               msg = MIMEMultipart()
               msg["From"] = SMTP_USER
               msg["To"] = ALERT_EMAIL
               msg["Subject"] = subject
-              msg.attach(MIMEText(body, "plain", "utf-8"))
+
+              msg.attach(
+                  MIMEText(
+                      body,
+                      "plain",
+                      "utf-8"
+                  )
+              )
+
+              context = ssl.create_default_context()
 
               with smtplib.SMTP_SSL(
                   "smtp.qq.com",
                   465,
-                  context=ssl.create_default_context(),
+                  context=context,
                   timeout=30
               ) as server:
-                  server.login(SMTP_USER, SMTP_PASSWORD)
+                  server.login(
+                      SMTP_USER,
+                      SMTP_PASSWORD
+                  )
+
                   server.sendmail(
                       SMTP_USER,
                       [ALERT_EMAIL],
@@ -71,21 +100,30 @@ jobs:
                   )
 
 
-          def clean(text):
-              return re.sub(r"\s+", " ", text or "").strip()
+          def save_screenshot(page, name):
+              try:
+                  page.screenshot(
+                      path=f"{safe_name(name)}.png",
+                      full_page=True
+                  )
+              except Exception as e:
+                  log(
+                      f"Screenshot failed: {e}"
+                  )
 
 
           def close_cookie_popup(page):
               """
-              Hurtigruten uses OneTrust.
-              The overlay:
-              onetrust-pc-dark-filter
-              can intercept all pointer events.
+              Remove the OneTrust cookie overlay.
+
+              The previous error showed:
+              .onetrust-pc-dark-filter
+              intercepts pointer events.
               """
 
-              print("Checking cookie popup...")
+              log("Checking OneTrust cookie popup...")
 
-              # Accept/reject buttons used by OneTrust.
+              # First try normal Accept button.
               selectors = [
                   "#onetrust-accept-btn-handler",
                   "#onetrust-reject-all-handler",
@@ -95,11 +133,16 @@ jobs:
 
               for selector in selectors:
                   try:
-                      button = page.locator(selector).first
+                      button = page.locator(
+                          selector
+                      ).first
 
-                      if button.is_visible(timeout=2000):
-                          print(
-                              f"Cookie button found: {selector}"
+                      if button.is_visible(
+                          timeout=1500
+                      ):
+                          log(
+                              f"Cookie button found: "
+                              f"{selector}"
                           )
 
                           button.click(
@@ -107,34 +150,762 @@ jobs:
                               timeout=10000
                           )
 
-                          page.wait_for_timeout(1500)
-                          print("Cookie popup closed.")
+                          page.wait_for_timeout(
+                              1500
+                          )
+
                           return
+
                   except Exception:
                       pass
 
-              # Sometimes the popup has already been handled
-              # but the overlay remains for a short time.
+              # If no button can be clicked,
+              # remove the blocking overlay.
               try:
                   page.locator(
-                      "#onetrust-pc-sdk"
-                  ).evaluate(
-                      "(e) => e.remove()"
+                      ".onetrust-pc-dark-filter"
+                  ).evaluate_all(
+                      """
+                      elements => {
+                          elements.forEach(
+                              element => element.remove()
+                          );
+                      }
+                      """
                   )
-              except Exception:
-                  pass
+
+                  log(
+                      "Removed OneTrust dark filter."
+                  )
+
+              except Exception as e:
+                  log(
+                      f"Could not remove dark filter: {e}"
+                  )
 
               try:
                   page.locator(
                       "#onetrust-consent-sdk"
                   ).evaluate(
                       """
-                      (e) => {
-                          e.style.pointerEvents = 'none';
+                      element => {
+                          element.style.pointerEvents = 'none';
                       }
                       """
                   )
+
+                  log(
+                      "Disabled OneTrust pointer events."
+                  )
+
               except Exception:
                   pass
 
+              page.wait_for_timeout(500)
+
+
+          def page_text(page):
               try:
+                  return page.locator(
+                      "body"
+                  ).inner_text(
+                      timeout=30000
+                  )
+              except Exception as e:
+                  log(
+                      f"Could not read page text: {e}"
+                  )
+
+                  return ""
+
+
+          def select_port(
+              page,
+              input_index,
+              port
+          ):
+              close_cookie_popup(page)
+
+              inputs = page.locator(
+                  "input"
+              )
+
+              if inputs.count() <= input_index:
+                  raise RuntimeError(
+                      f"Input {input_index} not found"
+                  )
+
+              box = inputs.nth(
+                  input_index
+              )
+
+              log(
+                  f"Selecting "
+                  f"{'FROM' if input_index == 0 else 'TO'}: "
+                  f"{port}"
+              )
+
+              # Force is intentional:
+              # OneTrust may still have a transparent layer.
+              box.click(
+                  force=True,
+                  timeout=15000
+              )
+
+              box.fill("")
+
+              box.type(
+                  port,
+                  delay=70
+              )
+
+              page.wait_for_timeout(
+                  2000
+              )
+
+              # Exact visible text.
+              exact = page.get_by_text(
+                  port,
+                  exact=True
+              )
+
+              for i in range(
+                  exact.count() - 1,
+                  -1,
+                  -1
+              ):
+                  try:
+                      item = exact.nth(i)
+
+                      if item.is_visible():
+                          item.click(
+                              force=True,
+                              timeout=10000
+                          )
+
+                          page.wait_for_timeout(
+                              1000
+                          )
+
+                          log(
+                              f"Selected: {port}"
+                          )
+
+                          return
+
+                  except Exception:
+                      pass
+
+              # Autocomplete options.
+              candidates = page.locator(
+                  '[role="option"], '
+                  'li, '
+                  '[class*="option"], '
+                  '[class*="autocomplete"]'
+              )
+
+              for i in range(
+                  candidates.count()
+              ):
+                  try:
+                      item = candidates.nth(i)
+
+                      if not item.is_visible():
+                          continue
+
+                      text = item.inner_text().strip()
+
+                      if port.lower() in text.lower():
+                          item.click(
+                              force=True,
+                              timeout=10000
+                          )
+
+                          page.wait_for_timeout(
+                              1000
+                          )
+
+                          log(
+                              f"Selected fallback: {text}"
+                          )
+
+                          return
+
+                  except Exception:
+                      pass
+
+              # Keyboard fallback.
+              try:
+                  box.press(
+                      "ArrowDown"
+                  )
+
+                  box.press(
+                      "Enter"
+                  )
+
+                  page.wait_for_timeout(
+                      1000
+                  )
+
+                  value = box.input_value()
+
+                  if port.lower() in value.lower():
+                      log(
+                          f"Selected by keyboard: {port}"
+                      )
+
+                      return
+
+              except Exception:
+                  pass
+
+              raise RuntimeError(
+                  f"Could not select port: {port}"
+              )
+
+
+          def select_date_if_available(page):
+              log(
+                  f"Trying target date: "
+                  f"{TARGET_DATE}"
+              )
+
+              # Native date field.
+              date_inputs = page.locator(
+                  'input[type="date"]'
+              )
+
+              for i in range(
+                  date_inputs.count()
+              ):
+                  try:
+                      field = date_inputs.nth(i)
+
+                      if (
+                          field.is_visible()
+                          and field.is_enabled()
+                      ):
+                          field.fill(
+                              TARGET_DATE
+                          )
+
+                          page.wait_for_timeout(
+                              1000
+                          )
+
+                          log(
+                              "Date selected using "
+                              "input[type=date]"
+                          )
+
+                          return True
+
+                  except Exception:
+                      pass
+
+              # Other date-like inputs.
+              candidates = page.locator(
+                  'input[name*="date" i], '
+                  'input[placeholder*="date" i], '
+                  'input[aria-label*="date" i]'
+              )
+
+              for i in range(
+                  candidates.count()
+              ):
+                  try:
+                      field = candidates.nth(i)
+
+                      if (
+                          field.is_visible()
+                          and field.is_enabled()
+                      ):
+                          field.fill(
+                              TARGET_DATE
+                          )
+
+                          page.wait_for_timeout(
+                              1000
+                          )
+
+                          log(
+                              "Date selected using "
+                              "date-like input"
+                          )
+
+                          return True
+
+                  except Exception:
+                      pass
+
+              return False
+
+
+          def find_search_button(page):
+              patterns = [
+                  r"^Search$",
+                  r"Search",
+                  r"Show availability",
+                  r"Find availability",
+                  r"Check availability",
+                  r"Continue",
+              ]
+
+              for pattern in patterns:
+                  buttons = page.get_by_role(
+                      "button",
+                      name=re.compile(
+                          pattern,
+                          re.I
+                      )
+                  )
+
+                  for i in range(
+                      buttons.count()
+                  ):
+                      try:
+                          button = buttons.nth(i)
+
+                          if (
+                              button.is_visible()
+                              and button.is_enabled()
+                          ):
+                              return button
+
+                      except Exception:
+                          pass
+
+              return None
+
+
+          def inspect_result(
+              page,
+              route
+          ):
+              text = page_text(page)
+              lower = text.lower()
+
+              log(
+                  "----- RESULT PAGE -----"
+              )
+
+              log(
+                  f"URL: {page.url}"
+              )
+
+              log(
+                  f"TITLE: {page.title()}"
+              )
+
+              print(
+                  text[:40000]
+              )
+
+              save_screenshot(
+                  page,
+                  "result_"
+                  + route[0]
+                  + "_"
+                  + route[1]
+              )
+
+              date_patterns = [
+                  "7 february 2027",
+                  "07 february 2027",
+                  "february 7, 2027",
+                  "7 feb 2027",
+                  "07 feb 2027",
+                  "2027-02-07",
+                  "07/02/2027",
+                  "7/2/2027",
+                  "07.02.2027",
+              ]
+
+              date_found = any(
+                  x in lower
+                  for x in date_patterns
+              )
+
+              negative_patterns = [
+                  "no availability",
+                  "no voyages",
+                  "no sailings",
+                  "not available",
+                  "sold out",
+                  "no results",
+                  "nothing found",
+              ]
+
+              positive_patterns = [
+                  "available",
+                  "availability",
+                  "departure",
+                  "sailing",
+                  "voyage",
+                  "price",
+              ]
+
+              negative_hits = [
+                  x
+                  for x in negative_patterns
+                  if x in lower
+              ]
+
+              positive_hits = [
+                  x
+                  for x in positive_patterns
+                  if x in lower
+              ]
+
+              has_price = bool(
+                  re.search(
+                      r"(€|EUR|NOK|£|GBP|\$|USD)\s?\d",
+                      text,
+                      re.I
+                  )
+                  or
+                  re.search(
+                      r"\d[\d,.]*\s?"
+                      r"(EUR|NOK|GBP|USD)",
+                      text,
+                      re.I
+                  )
+              )
+
+              log(
+                  f"Target date found: "
+                  f"{date_found}"
+              )
+
+              log(
+                  f"Positive terms: "
+                  f"{positive_hits}"
+              )
+
+              log(
+                  f"Negative terms: "
+                  f"{negative_hits}"
+              )
+
+              log(
+                  f"Price detected: "
+                  f"{has_price}"
+              )
+
+              potential = (
+                  date_found
+                  and not negative_hits
+                  and (
+                      has_price
+                      or "available" in lower
+                      or "availability" in lower
+                      or "departure" in lower
+                      or "sailing" in lower
+                      or "voyage" in lower
+                  )
+              )
+
+              return potential
+
+
+          def check_route(
+              browser,
+              route
+          ):
+              context = browser.new_context(
+                  viewport={
+                      "width": 1440,
+                      "height": 1000
+                  },
+                  locale="en-GB",
+                  timezone_id="Europe/Oslo"
+              )
+
+              page = context.new_page()
+
+              page.set_default_timeout(
+                  30000
+              )
+
+              try:
+                  log("")
+                  log("=" * 80)
+                  log(
+                      f"CHECKING: "
+                      f"{route[0]} -> {route[1]}"
+                  )
+                  log("=" * 80)
+
+                  page.goto(
+                      URL,
+                      wait_until="domcontentloaded",
+                      timeout=120000
+                  )
+
+                  page.wait_for_timeout(
+                      7000
+                  )
+
+                  # FIX:
+                  # Deal with cookie overlay BEFORE
+                  # any interaction.
+                  close_cookie_popup(
+                      page
+                  )
+
+                  save_screenshot(
+                      page,
+                      "before_"
+                      + route[0]
+                      + "_"
+                      + route[1]
+                  )
+
+                  select_port(
+                      page,
+                      0,
+                      route[0]
+                  )
+
+                  select_port(
+                      page,
+                      1,
+                      route[1]
+                  )
+
+                  page.wait_for_timeout(
+                      1500
+                  )
+
+                  select_date_if_available(
+                      page
+                  )
+
+                  page.wait_for_timeout(
+                      1000
+                  )
+
+                  close_cookie_popup(
+                      page
+                  )
+
+                  button = find_search_button(
+                      page
+                  )
+
+                  if button is None:
+                      raise RuntimeError(
+                          "Could not find "
+                          "Search/Availability button"
+                      )
+
+                  log(
+                      "Clicking search button: "
+                      + button.inner_text().strip()
+                  )
+
+                  button.click(
+                      force=True
+                  )
+
+                  page.wait_for_timeout(
+                      6000
+                  )
+
+                  try:
+                      page.wait_for_load_state(
+                          "domcontentloaded",
+                          timeout=30000
+                      )
+                  except Exception:
+                      pass
+
+                  page.wait_for_timeout(
+                      5000
+                  )
+
+                  potential = inspect_result(
+                      page,
+                      route
+                  )
+
+                  return {
+                      "route": route,
+                      "potential": potential,
+                      "url": page.url
+                  }
+
+              except Exception as e:
+                  log(
+                      f"ERROR checking "
+                      f"{route[0]} -> {route[1]}: "
+                      f"{type(e).__name__}: {e}"
+                  )
+
+                  save_screenshot(
+                      page,
+                      "ERROR_"
+                      + route[0]
+                      + "_"
+                      + route[1]
+                  )
+
+                  return {
+                      "route": route,
+                      "potential": False,
+                      "error": (
+                          f"{type(e).__name__}: "
+                          f"{e}"
+                      ),
+                      "url": page.url
+                  }
+
+              finally:
+                  context.close()
+
+
+          def main():
+              log(
+                  "Starting Hurtigruten monitor"
+              )
+
+              log(
+                  f"Target date: {TARGET_DATE}"
+              )
+
+              found = []
+              failures = []
+              results = []
+
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(
+                      headless=True
+                  )
+
+                  for route in ROUTES:
+                      result = check_route(
+                          browser,
+                          route
+                      )
+
+                      if result.get(
+                          "potential"
+                      ):
+                          found.append(
+                              result
+                          )
+
+                      if result.get(
+                          "error"
+                      ):
+                          failures.append(
+                              result
+                          )
+
+                      results.append(
+                          result
+                      )
+
+                  browser.close()
+
+              # Availability notification.
+              if found:
+                  lines = [
+                      "Hurtigruten "
+                      "availability detected.",
+                      "",
+                      f"Target date: "
+                      f"{TARGET_DATE}",
+                      "",
+                  ]
+
+                  for result in found:
+                      route = result["route"]
+
+                      lines.append(
+                          f"{route[0]} -> "
+                          f"{route[1]}"
+                      )
+
+                      lines.append(
+                          f"URL: "
+                          f"{result.get('url', '')}"
+                      )
+
+                      lines.append("")
+
+                  send_email(
+                      "Hurtigruten "
+                      "availability FOUND",
+                      "\n".join(lines)
+                  )
+
+              # Error notification.
+              if failures:
+                  lines = [
+                      "Hurtigruten monitor ERROR",
+                      "",
+                      f"Target date: "
+                      f"{TARGET_DATE}",
+                      "",
+                  ]
+
+                  for result in failures:
+                      route = result["route"]
+
+                      lines.extend([
+                          f"{route[0]} -> "
+                          f"{route[1]}",
+                          result.get(
+                              "error",
+                              "Unknown error"
+                          ),
+                          ""
+                      ])
+
+                  send_email(
+                      "Hurtigruten monitor ERROR",
+                      "\n".join(lines)
+                  )
+
+              log("")
+              log("=" * 80)
+              log("FINAL RESULTS")
+              log("=" * 80)
+
+              for result in results:
+                  route = result["route"]
+
+                  log(
+                      f"{route[0]} -> "
+                      f"{route[1]}: "
+                      f"{'AVAILABLE' if result.get('potential') else 'NO'}"
+                  )
+
+              log(
+                  "Monitor finished."
+              )
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run monitor
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python monitor.py
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: hurtigruten-diagnostics
+          path: |
+            *.png
+            monitor.py
+          if-no-files-found: ignore
