@@ -8,7 +8,7 @@ on:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -34,7 +34,7 @@ jobs:
           import smtplib
           from pathlib import Path
           from email.mime.text import MIMEText
-          from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+          from playwright.async_api import async_playwright
 
           BOOKING_URL = "https://www.hurtigruten.com/en/port-to-port/booking"
           TARGET_DATE = "2027-02-07"
@@ -47,13 +47,13 @@ jobs:
 
           STATE_FILE = Path("availability_state.json")
 
-          SMTP_USER = os.environ.get("SMTP_USER", "")
-          SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-          ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "")
+          SMTP_USER = os.environ["SMTP_USER"]
+          SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
+          ALERT_EMAIL = os.environ["ALERT_EMAIL"]
 
           results = []
           errors = []
-          requests_seen = []
+          network_hits = []
 
           def redact(s):
               if not s:
@@ -65,450 +65,460 @@ jobs:
                   r'([?&](?:auth|token|access_token|refresh_token|code|session)=)[^&\s]+',
                   r'\1[REDACTED]',
                   s,
-                  flags=re.I,
+                  flags=re.I
               )
 
-              s = re.sub(
-                  r'((?:authorization|cookie|set-cookie|auth|token|access_token|refresh_token)\s*[:=]\s*)[^,\s}&]+',
-                  r'\1[REDACTED]',
-                  s,
-                  flags=re.I,
-              )
-
-              return s[:4000]
+              return s[:3000]
 
           def load_state():
               try:
                   if STATE_FILE.exists():
                       return json.loads(
-                          STATE_FILE.read_text(encoding="utf-8")
+                          STATE_FILE.read_text(
+                              encoding="utf-8"
+                          )
                       )
               except Exception:
                   pass
 
               return {}
 
-          def save_state(state):
+          def save_state(data):
               STATE_FILE.write_text(
                   json.dumps(
-                      state,
+                      data,
                       ensure_ascii=False,
                       indent=2
                   ),
                   encoding="utf-8"
               )
 
-          async def hide_cookie_layer(page):
+          async def remove_cookie(page):
               try:
                   await page.evaluate("""
                   () => {
-                    const selectors = [
-                      '#onetrust-banner-sdk',
-                      '#onetrust-consent-sdk',
-                      '.onetrust-pc-dark-filter'
-                    ];
+                      for (const s of [
+                          '#onetrust-banner-sdk',
+                          '#onetrust-consent-sdk',
+                          '.onetrust-pc-dark-filter'
+                      ]) {
+                          document.querySelectorAll(s)
+                            .forEach(e => e.remove());
+                      }
 
-                    for (const selector of selectors) {
-                      document.querySelectorAll(selector).forEach(e => e.remove());
-                    }
-
-                    document.body.style.overflow = 'auto';
+                      document.body.style.overflow = 'auto';
                   }
                   """)
-              except Exception:
+              except:
                   pass
 
-          async def visible_port_inputs(page):
-              data = await page.locator("input").evaluate_all("""
-              els => els.map((e,i) => {
-                const r = e.getBoundingClientRect();
+          async def get_booking_frame(page):
+              """
+              Find the frame containing the actual Port-to-Port
+              booking controls.
 
-                return {
-                  i,
-                  type: e.type || "",
-                  value: e.value || "",
-                  name: e.name || "",
-                  id: e.id || "",
-                  placeholder: e.placeholder || "",
-                  aria: e.getAttribute("aria-label") || "",
-                  visible:
-                    r.width > 0 &&
-                    r.height > 0 &&
-                    getComputedStyle(e).display !== "none" &&
-                    getComputedStyle(e).visibility !== "hidden"
-                };
+              The previous diagnostic showed the real controls
+              inside a frame, so never assume the main document.
+              """
+
+              for _ in range(30):
+                  await page.wait_for_timeout(500)
+
+                  frames = page.frames
+
+                  for frame in frames:
+                      try:
+                          inputs = frame.locator("input")
+
+                          if await inputs.count() == 0:
+                              continue
+
+                          visible = 0
+
+                          for i in range(
+                              min(await inputs.count(), 30)
+                          ):
+                              try:
+                                  if await inputs.nth(i).is_visible():
+                                      visible += 1
+                              except:
+                                  pass
+
+                          if visible >= 2:
+                              return frame
+
+                      except:
+                          pass
+
+              raise RuntimeError(
+                  "Could not find Hurtigruten booking frame"
+              )
+
+          async def get_visible_inputs(frame):
+              data = await frame.locator("input").evaluate_all("""
+              els => els.map((e,i) => {
+                  const r = e.getBoundingClientRect();
+
+                  return {
+                      i: i,
+                      type: e.type || "",
+                      name: e.name || "",
+                      id: e.id || "",
+                      value: e.value || "",
+                      placeholder: e.placeholder || "",
+                      aria: e.getAttribute("aria-label") || "",
+                      visible:
+                          r.width > 0 &&
+                          r.height > 0 &&
+                          getComputedStyle(e).display !== "none" &&
+                          getComputedStyle(e).visibility !== "hidden"
+                  };
               })
               """)
 
-              candidates = []
+              return [
+                  x for x in data
+                  if x["visible"]
+              ]
 
-              for x in data:
-                  if not x["visible"]:
-                      continue
-
-                  typ = x["type"].lower()
-
-                  if typ not in ("text", "search", ""):
-                      continue
-
-                  candidates.append(x)
-
-              return candidates
-
-          async def choose_port(page, input_index, port):
-              inputs = page.locator("input")
-              el = inputs.nth(input_index)
+          async def select_port(frame, index, port):
+              inputs = frame.locator("input")
+              el = inputs.nth(index)
 
               await el.click()
               await el.press("Control+A")
               await el.fill(port)
 
-              await page.wait_for_timeout(700)
+              await frame.wait_for_timeout(700)
 
-              # Prefer an exact visible option.
-              exact = page.get_by_text(port, exact=True)
+              # Exact option.
+              option = frame.get_by_text(
+                  port,
+                  exact=True
+              )
 
-              for i in range(await exact.count()):
+              for i in range(await option.count()):
                   try:
-                      item = exact.nth(i)
+                      item = option.nth(i)
 
                       if await item.is_visible():
                           await item.click()
-                          await page.wait_for_timeout(500)
+                          await frame.wait_for_timeout(500)
                           return True
-                  except Exception:
+                  except:
                       pass
 
-              # Some versions use listbox options.
-              for selector in [
-                  '[role="option"]',
-                  'li',
-                  '[data-testid*="option"]',
-              ]:
-                  loc = page.locator(selector)
+              # ARIA option.
+              option = frame.locator(
+                  '[role="option"]'
+              )
 
-                  for i in range(await loc.count()):
-                      try:
-                          item = loc.nth(i)
+              for i in range(await option.count()):
+                  try:
+                      item = option.nth(i)
 
-                          if not await item.is_visible():
-                              continue
+                      if not await item.is_visible():
+                          continue
 
-                          text = (await item.inner_text()).strip()
+                      text = (
+                          await item.inner_text()
+                      ).strip()
 
-                          if text == port or port in text:
-                              await item.click()
-                              await page.wait_for_timeout(500)
-                              return True
+                      if port.lower() in text.lower():
+                          await item.click()
+                          await frame.wait_for_timeout(500)
+                          return True
+                  except:
+                      pass
 
-                      except Exception:
-                          pass
+              # Keyboard fallback.
+              await el.press("Enter")
+              await frame.wait_for_timeout(500)
 
-              try:
-                  await el.press("Enter")
-                  await page.wait_for_timeout(300)
-                  return True
-              except Exception:
-                  return False
+              return True
 
-          async def set_ports(page, origin, destination):
-              inputs = await visible_port_inputs(page)
+          async def set_ports(frame, origin, destination):
+              inputs = await get_visible_inputs(frame)
 
-              # The booking form has two visible text inputs.
-              if len(inputs) < 2:
+              print(
+                  "VISIBLE INPUTS:",
+                  json.dumps(
+                      inputs,
+                      ensure_ascii=False
+                  )
+              )
+
+              # Identify port fields from their actual values,
+              # names, placeholders, or position.
+              candidates = []
+
+              for x in inputs:
+                  typ = x["type"].lower()
+
+                  if typ in (
+                      "text",
+                      "search",
+                      ""
+                  ):
+                      candidates.append(x)
+
+              if len(candidates) < 2:
                   raise RuntimeError(
-                      "Could not find the two Port-to-Port inputs"
+                      "Booking frame found, but fewer than "
+                      "two visible port inputs exist"
                   )
 
-              ok1 = await choose_port(
-                  page,
-                  inputs[0]["i"],
+              # Use the first two suitable fields.
+              first = candidates[0]["i"]
+              second = candidates[1]["i"]
+
+              await select_port(
+                  frame,
+                  first,
                   origin
               )
 
-              await page.wait_for_timeout(400)
+              await frame.wait_for_timeout(700)
 
-              # Re-read because React can replace DOM nodes.
-              inputs = await visible_port_inputs(page)
+              # React can replace the inputs.
+              inputs = await get_visible_inputs(frame)
 
-              if len(inputs) < 2:
+              candidates = [
+                  x for x in inputs
+                  if x["type"].lower()
+                  in ("text", "search", "")
+              ]
+
+              if len(candidates) < 2:
                   raise RuntimeError(
-                      "Destination input disappeared"
+                      "Destination field disappeared"
                   )
 
-              ok2 = await choose_port(
-                  page,
-                  inputs[1]["i"],
+              await select_port(
+                  frame,
+                  candidates[1]["i"],
                   destination
               )
 
-              if not ok1 or not ok2:
-                  raise RuntimeError(
-                      f"Port selection failed: {origin} -> {destination}"
-                  )
+          async def set_date(frame):
+              inputs = await get_visible_inputs(frame)
 
-          async def find_date_control(page):
-              data = await page.locator("input").evaluate_all("""
-              els => els.map((e,i) => {
-                const r=e.getBoundingClientRect();
-
-                return {
-                  i,
-                  type:e.type || "",
-                  value:e.value || "",
-                  name:e.name || "",
-                  id:e.id || "",
-                  placeholder:e.placeholder || "",
-                  aria:e.getAttribute("aria-label") || "",
-                  visible:
-                    r.width > 0 &&
-                    r.height > 0 &&
-                    getComputedStyle(e).display !== "none" &&
-                    getComputedStyle(e).visibility !== "hidden",
-                  outer:e.outerHTML.slice(0,2500)
-                };
-              })
-              """)
-
-              # First priority: actual HTML date input.
-              for x in data:
-                  if x["visible"] and x["type"].lower() == "date":
-                      return x
-
-              # Second priority: obvious date-related field.
-              for x in data:
-                  if not x["visible"]:
-                      continue
-
-                  hay = " ".join([
-                      x["name"],
-                      x["id"],
-                      x["placeholder"],
-                      x["aria"]
-                  ]).lower()
-
-                  if "date" in hay or "departure" in hay:
-                      return x
-
-              # Third: current date-like value.
-              for x in data:
-                  if not x["visible"]:
-                      continue
-
-                  value = x["value"]
-
-                  if re.match(
-                      r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$",
-                      value
-                  ):
-                      return x
-
-              return None
-
-          async def set_date(page):
-              control = await find_date_control(page)
-
-              if not control:
-                  raise RuntimeError(
-                      "Could not find departure date input"
-                  )
-
-              el = page.locator("input").nth(control["i"])
-
-              typ = control["type"].lower()
-
-              # Native date input.
-              if typ == "date":
-                  await el.fill(TARGET_DATE)
-                  await el.press("Tab")
-                  await page.wait_for_timeout(500)
-
-                  return True
-
-              # Text/date-picker input.
-              await el.click()
-
-              try:
-                  await el.press("Control+A")
-              except Exception:
-                  pass
-
-              # Try ISO first.
-              try:
-                  await el.fill(TARGET_DATE)
-                  await el.press("Tab")
-                  await page.wait_for_timeout(500)
-
-                  value = await el.input_value()
-
-                  if value:
-                      return True
-              except Exception:
-                  pass
-
-              # European format.
-              for value in [
-                  "07/02/2027",
-                  "07/02/27",
-                  "07.02.2027",
-              ]:
-                  try:
-                      await el.click()
-                      await el.press("Control+A")
-                      await el.fill(value)
-                      await el.press("Tab")
-                      await page.wait_for_timeout(300)
-
-                      current = await el.input_value()
-
-                      if current:
-                          return True
-
-                  except Exception:
-                      pass
-
-              # Date picker fallback.
-              try:
-                  await el.click()
-                  await page.wait_for_timeout(500)
-
-                  # Look for February 2027 / day 7.
-                  body = (await page.locator("body").inner_text())[:20000]
-
-                  if "2027" in body or "February" in body:
-                      buttons = page.locator("button")
-
-                      for i in range(await buttons.count()):
-                          b = buttons.nth(i)
-
-                          try:
-                              if not await b.is_visible():
-                                  continue
-
-                              txt = (await b.inner_text()).strip()
-
-                              if txt == "7":
-                                  await b.click()
-                                  await page.wait_for_timeout(300)
-                                  return True
-
-                          except Exception:
-                              pass
-
-              except Exception:
-                  pass
-
-              return False
-
-          async def get_visible_text(page):
-              try:
-                  return (await page.locator("body").inner_text())[:30000]
-              except Exception:
-                  return ""
-
-          async def inspect_result(page):
-              url = page.url
-              text = await get_visible_text(page)
-
-              combined = (url + "\n" + text).lower()
-
-              # Strong positive signals.
-              positive = [
-                  "select departure",
-                  "available",
-                  "choose departure",
-                  "departure time",
-                  "price",
-                  "nok",
-                  "eur",
-                  "book now",
-                  "continue",
-                  "select sailing",
-                  "select voyage",
-              ]
-
-              # Strong negative signals.
-              negative = [
-                  "no departures",
-                  "no availability",
-                  "no sailings",
-                  "not available",
-                  "sold out",
-                  "there are no",
-                  "no results",
-              ]
-
-              pos = sum(x in combined for x in positive)
-              neg = sum(x in combined for x in negative)
-
-              # A URL that is no longer the booking form is important.
-              left_booking = (
-                  "/port-to-port/booking" not in url
-                  and (
-                      "booking" in url.lower()
-                      or "voyage" in url.lower()
-                      or "search" in url.lower()
+              print(
+                  "DATE SEARCH INPUTS:",
+                  json.dumps(
+                      inputs,
+                      ensure_ascii=False
                   )
               )
 
-              if neg > 0:
-                  return False, "No availability text detected"
+              candidate = None
 
-              if left_booking and pos > 0:
-                  return True, "Booking/result page detected"
+              # Actual date input.
+              for x in inputs:
+                  if x["type"].lower() == "date":
+                      candidate = x
+                      break
 
-              if pos >= 2:
-                  return True, "Availability/result indicators detected"
+              # Date-related attributes.
+              if candidate is None:
+                  for x in inputs:
+                      hay = " ".join([
+                          x["name"],
+                          x["id"],
+                          x["placeholder"],
+                          x["aria"]
+                      ]).lower()
 
-              return False, "No confirmed availability"
+                      if (
+                          "date" in hay
+                          or "departure" in hay
+                      ):
+                          candidate = x
+                          break
 
-          async def trigger_booking(page):
-              # First try normal submit controls.
-              selectors = [
-                  'button[type="submit"]',
-                  'input[type="submit"]',
-                  'button[data-testid*="submit" i]',
-                  'button[data-testid*="continue" i]',
-                  'button[data-testid*="search" i]',
-              ]
+              # Date-like current value.
+              if candidate is None:
+                  for x in inputs:
+                      if re.match(
+                          r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$",
+                          x["value"]
+                      ):
+                          candidate = x
+                          break
 
-              for selector in selectors:
-                  loc = page.locator(selector)
+              if candidate is None:
+                  raise RuntimeError(
+                      "Could not find departure date input "
+                      "inside booking frame"
+                  )
 
-                  for i in range(await loc.count()):
+              el = frame.locator(
+                  "input"
+              ).nth(candidate["i"])
+
+              print(
+                  "DATE CONTROL:",
+                  candidate
+              )
+
+              # Native date input.
+              if candidate["type"].lower() == "date":
+                  await el.fill(TARGET_DATE)
+                  await el.dispatch_event("input")
+                  await el.dispatch_event("change")
+                  await el.press("Tab")
+                  return True
+
+              # React-compatible native setter.
+              result = await el.evaluate(
+                  """(el, value) => {
+                      const proto =
+                        Object.getPrototypeOf(el);
+
+                      const descriptor =
+                        Object.getOwnPropertyDescriptor(
+                          proto,
+                          'value'
+                        );
+
+                      if (descriptor &&
+                          descriptor.set) {
+                          descriptor.set.call(
+                            el,
+                            value
+                          );
+                      } else {
+                          el.value = value;
+                      }
+
+                      el.dispatchEvent(
+                        new Event(
+                          'input',
+                          {bubbles:true}
+                        )
+                      );
+
+                      el.dispatchEvent(
+                        new Event(
+                          'change',
+                          {bubbles:true}
+                        )
+                      );
+
+                      return el.value;
+                  }""",
+                  TARGET_DATE
+              )
+
+              print(
+                  "DATE SET RESULT:",
+                  result
+              )
+
+              await el.press("Tab")
+              await frame.wait_for_timeout(500)
+
+              return bool(result)
+
+          async def get_buttons(frame):
+              return await frame.locator(
+                  "button"
+              ).evaluate_all("""
+              els => els.map((e,i) => {
+                  const r=e.getBoundingClientRect();
+
+                  return {
+                      i,
+                      text:(e.innerText || '').trim(),
+                      aria:e.getAttribute('aria-label') || '',
+                      type:e.type || '',
+                      visible:
+                          r.width > 0 &&
+                          r.height > 0 &&
+                          getComputedStyle(e).display !== 'none' &&
+                          getComputedStyle(e).visibility !== 'hidden'
+                  };
+              }).filter(x => x.visible)
+              """)
+
+          async def submit(frame, page):
+              buttons = await get_buttons(frame)
+
+              print(
+                  "VISIBLE BUTTONS:",
+                  json.dumps(
+                      buttons,
+                      ensure_ascii=False
+                  )
+              )
+
+              # First: native submit.
+              for b in buttons:
+                  text = (
+                      b["text"] + " " + b["aria"]
+                  ).lower()
+
+                  if (
+                      b["type"].lower() == "submit"
+                      or any(x in text for x in [
+                          "search",
+                          "continue",
+                          "find",
+                          "check availability",
+                          "show sailings",
+                      ])
+                  ):
                       try:
-                          item = loc.nth(i)
+                          await frame.locator(
+                              "button"
+                          ).nth(
+                              b["i"]
+                          ).click()
 
-                          if await item.is_visible():
-                              await item.click()
-                              await page.wait_for_timeout(5000)
+                          await page.wait_for_timeout(
+                              6000
+                          )
 
-                              return True
-                      except Exception:
+                          return True
+                      except:
                           pass
 
-              # Then cabin choice.
-              for text in [
+              # The real page has these two cabin choices.
+              for cabin in [
                   "I do not want to book a cabin",
                   "I want to book a cabin",
               ]:
-                  loc = page.get_by_text(text, exact=True)
+                  loc = frame.get_by_text(
+                      cabin,
+                      exact=True
+                  )
 
                   for i in range(await loc.count()):
                       try:
                           item = loc.nth(i)
 
                           if await item.is_visible():
+                              print(
+                                  "CLICK:",
+                                  cabin
+                              )
+
                               await item.click()
-                              await page.wait_for_timeout(6000)
+
+                              await page.wait_for_timeout(
+                                  7000
+                              )
 
                               return True
-                      except Exception:
-                          pass
+                      except Exception as e:
+                          print(
+                              "CABIN CLICK ERROR:",
+                              repr(e)
+                          )
 
-              # Finally submit the actual form through DOM.
+              # Form submit fallback.
               try:
-                  forms = page.locator("form")
+                  forms = frame.locator("form")
 
                   for i in range(await forms.count()):
                       form = forms.nth(i)
@@ -518,18 +528,113 @@ jobs:
                               "(f) => f.requestSubmit()"
                           )
 
-                          await page.wait_for_timeout(6000)
-                          return True
+                          await page.wait_for_timeout(
+                              7000
+                          )
 
-              except Exception:
-                  pass
+                          return True
+              except Exception as e:
+                  print(
+                      "FORM SUBMIT ERROR:",
+                      repr(e)
+                  )
 
               return False
 
-          async def check_route(page, origin, destination):
-              label = f"{origin} -> {destination}"
+          async def page_text(page, frame):
+              texts = []
 
-              print(f"Checking {label}")
+              try:
+                  texts.append(
+                      await page.locator(
+                          "body"
+                      ).inner_text()
+                  )
+              except:
+                  pass
+
+              try:
+                  texts.append(
+                      await frame.locator(
+                          "body"
+                      ).inner_text()
+                  )
+              except:
+                  pass
+
+              return "\n".join(texts)[:60000]
+
+          def determine_availability(url, text):
+              combined = (
+                  url + "\n" + text
+              ).lower()
+
+              # Explicit negative.
+              negatives = [
+                  "no departures",
+                  "no availability",
+                  "no sailings",
+                  "no results",
+                  "not available",
+                  "sold out",
+              ]
+
+              for word in negatives:
+                  if word in combined:
+                      return False, (
+                          "Explicit no-availability text"
+                      )
+
+              # Strong positive result indicators.
+              positives = [
+                  "select departure",
+                  "select sailing",
+                  "select voyage",
+                  "departure time",
+                  "book now",
+                  "continue",
+                  "price",
+                  "nok",
+                  "eur",
+                  "available",
+              ]
+
+              score = sum(
+                  word in combined
+                  for word in positives
+              )
+
+              # Leaving the initial booking page is strong
+              # evidence that the search was actually executed.
+              result_url = (
+                  "/port-to-port/booking" not in url
+              )
+
+              if result_url and score >= 1:
+                  return True, (
+                      "Booking result page detected"
+                  )
+
+              if score >= 3:
+                  return True, (
+                      "Multiple availability indicators"
+                  )
+
+              return False, (
+                  "No confirmed availability"
+              )
+
+          async def check_route(page, origin, destination):
+              label = (
+                  f"{origin} -> {destination}"
+              )
+
+              print("")
+              print(
+                  "==========",
+                  label,
+                  "=========="
+              )
 
               await page.goto(
                   BOOKING_URL,
@@ -537,55 +642,84 @@ jobs:
                   timeout=60000
               )
 
-              await page.wait_for_timeout(3500)
+              await page.wait_for_timeout(4000)
 
-              await hide_cookie_layer(page)
+              await remove_cookie(page)
+
+              frame = await get_booking_frame(page)
+
+              print(
+                  "BOOKING FRAME:",
+                  frame.url
+              )
 
               await set_ports(
-                  page,
+                  frame,
                   origin,
                   destination
               )
 
-              await set_date(page)
-
-              await hide_cookie_layer(page)
-
-              # Give React a moment to update state.
               await page.wait_for_timeout(1000)
 
-              before_url = page.url
+              await set_date(frame)
 
-              triggered = await trigger_booking(page)
+              await page.wait_for_timeout(1500)
 
-              await page.wait_for_timeout(3000)
+              before = page.url
 
-              available, reason = await inspect_result(page)
+              triggered = await submit(
+                  frame,
+                  page
+              )
+
+              await page.wait_for_timeout(5000)
+
+              text = await page_text(
+                  page,
+                  frame
+              )
+
+              available, reason = (
+                  determine_availability(
+                      page.url,
+                      text
+                  )
+              )
 
               result = {
                   "route": label,
                   "available": available,
                   "reason": reason,
                   "triggered": triggered,
-                  "before_url": before_url,
+                  "before_url": before,
                   "after_url": page.url,
               }
 
+              print(
+                  json.dumps(
+                      result,
+                      ensure_ascii=False,
+                      indent=2
+                  )
+              )
+
               results.append(result)
 
-              print(json.dumps(
-                  result,
-                  ensure_ascii=False
-              ))
+              safe_name = (
+                  origin.replace(" ", "_")
+                  + "_"
+                  + destination.replace(" ", "_")
+              )
 
-              return available
+              try:
+                  await page.screenshot(
+                      path=f"{safe_name}.png",
+                      full_page=True
+                  )
+              except:
+                  pass
 
           async def send_email(subject, body):
-              if not SMTP_USER or not SMTP_PASSWORD or not ALERT_EMAIL:
-                  raise RuntimeError(
-                      "SMTP secrets are missing"
-                  )
-
               msg = MIMEText(
                   body,
                   "plain",
@@ -613,8 +747,6 @@ jobs:
                   )
 
           async def main():
-              state = load_state()
-
               async with async_playwright() as p:
                   browser = await p.chromium.launch(
                       headless=True
@@ -631,7 +763,7 @@ jobs:
 
                   page = await context.new_page()
 
-                  async def on_request(request):
+                  async def request_handler(request):
                       url = request.url.lower()
 
                       if request.resource_type in (
@@ -646,7 +778,7 @@ jobs:
                               "search",
                               "api",
                           ]):
-                              requests_seen.append(
+                              network_hits.append(
                                   redact(
                                       request.method
                                       + " "
@@ -656,7 +788,7 @@ jobs:
 
                   page.on(
                       "request",
-                      on_request
+                      request_handler
                   )
 
                   for origin, destination in ROUTES:
@@ -666,7 +798,6 @@ jobs:
                               origin,
                               destination
                           )
-
                       except Exception as e:
                           errors.append(
                               f"{origin} -> {destination}: "
@@ -675,39 +806,46 @@ jobs:
 
                   await browser.close()
 
-              # Build state.
-              current = {}
+              state = load_state()
+
+              old_routes = state.get(
+                  "routes",
+                  {}
+              )
+
+              current_routes = {}
 
               for r in results:
-                  current[r["route"]] = bool(
-                      r["available"]
-                  )
+                  current_routes[
+                      r["route"]
+                  ] = r["available"]
 
-              previous = state.get("routes", {})
+              newly_available = []
 
-              available_routes = [
-                  route
-                  for route, available
-                  in current.items()
-                  if available
-              ]
+              for route, available in (
+                  current_routes.items()
+              ):
+                  if (
+                      available
+                      and not old_routes.get(
+                          route,
+                          False
+                      )
+                  ):
+                      newly_available.append(
+                          route
+                      )
 
-              newly_available = [
-                  route
-                  for route in available_routes
-                  if not previous.get(route, False)
-              ]
-
-              # Save current status.
               save_state({
                   "target_date": TARGET_DATE,
-                  "routes": current
+                  "routes": current_routes
               })
 
               # Availability notification.
               if newly_available:
                   lines = [
-                      "Hurtigruten Port-to-Port availability detected.",
+                      "Hurtigruten Port-to-Port",
+                      "AVAILABILITY DETECTED",
                       "",
                       f"Target date: {TARGET_DATE}",
                       "",
@@ -718,31 +856,32 @@ jobs:
                           "AVAILABLE: " + route
                       )
 
-                  lines.extend([
+                  lines += [
                       "",
-                      "Please open the official Hurtigruten booking page:",
+                      "Open:",
                       BOOKING_URL,
                       "",
-                      "Current check results:",
-                  ])
+                      "Current status:",
+                  ]
 
                   for r in results:
                       lines.append(
-                          f'{r["route"]}: '
+                          r["route"]
+                          + ": "
                           + (
                               "AVAILABLE"
                               if r["available"]
-                              else "not confirmed"
+                              else "NO AVAILABILITY"
                           )
                       )
 
                   await send_email(
-                      "Hurtigruten AVAILABLE - "
+                      "Hurtigruten AVAILABLE "
                       + TARGET_DATE,
                       "\n".join(lines)
                   )
 
-              # Error notification.
+              # Technical error notification.
               if errors:
                   body = [
                       "Hurtigruten monitor ERROR",
@@ -753,19 +892,15 @@ jobs:
 
                   body.extend(errors)
 
-                  body.append("")
-                  body.append(
-                      "The monitor did not silently treat "
-                      "a technical failure as no availability."
-                  )
-
                   await send_email(
                       "Hurtigruten Monitor ERROR",
                       "\n".join(body)
                   )
 
               print("")
-              print("========== RESULTS ==========")
+              print(
+                  "========== FINAL =========="
+              )
 
               for r in results:
                   print(
@@ -776,10 +911,11 @@ jobs:
                       else "NO AVAILABILITY"
                   )
 
-              print("==============================")
+              print(
+                  "=========================="
+              )
 
-          if __name__ == "__main__":
-              asyncio.run(main())
+          asyncio.run(main())
           PY
 
       - name: Run monitor
@@ -798,6 +934,14 @@ jobs:
 
           if [ -f availability_state.json ]; then
             git add availability_state.json
-            git diff --cached --quiet || git commit -m "Update availability state"
+            git diff --cached --quiet || git commit -m "Update monitor state"
             git push || true
           fi
+
+      - name: Upload debug screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hurtigruten-debug
+          path: "*.png"
+          if-no-files-found: ignore
