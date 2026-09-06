@@ -1,12 +1,14 @@
-name: Hurtigruten Action Diagnostic
+name: Hurtigruten Monitor
 
 on:
+  schedule:
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
-  diagnose:
+  monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Checkout
@@ -22,7 +24,7 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
-      - name: Create diagnostic script
+      - name: Create monitor
         run: |
           cat > monitor.py <<'PY'
           import asyncio
@@ -30,11 +32,12 @@ jobs:
           import os
           import re
           import smtplib
+          import hashlib
+          from pathlib import Path
           from email.mime.text import MIMEText
-          from email.mime.multipart import MIMEMultipart
           from playwright.async_api import async_playwright
 
-          URL = "https://www.hurtigruten.com/en/port-to-port"
+          BOOKING_URL = "https://www.hurtigruten.com/en/port-to-port/booking"
           TARGET_DATE = "2027-02-07"
 
           ROUTES = [
@@ -43,558 +46,143 @@ jobs:
               ("Bodø", "Tromsø"),
           ]
 
-          logs = []
+          STATE_FILE = Path("availability_state.json")
 
-          def redact(text):
-              if not text:
+          SMTP_USER = os.environ["SMTP_USER"]
+          SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
+          ALERT_EMAIL = os.environ["ALERT_EMAIL"]
+
+          results = []
+
+          def clean(s):
+              if s is None:
                   return ""
-              text = str(text)
+              return re.sub(r"\s+", " ", str(s)).strip()
 
-              text = re.sub(
-                  r'([?&](?:auth|token|access_token|refresh_token|code|session)=)[^&\s]+',
-                  r'\1[REDACTED]',
-                  text,
-                  flags=re.I,
+          def fingerprint(text):
+              return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+          def load_state():
+              try:
+                  return json.loads(STATE_FILE.read_text())
+              except:
+                  return {}
+
+          def save_state(state):
+              STATE_FILE.write_text(
+                  json.dumps(state, ensure_ascii=False, indent=2)
               )
 
-              text = re.sub(
-                  r'("?(?:authorization|cookie|set-cookie|auth|token|access_token|refresh_token)"?\s*[:=]\s*)[^,\s}]+',
-                  r'\1[REDACTED]',
-                  text,
-                  flags=re.I,
-              )
-
-              return text[:3000]
-
-          def add(msg):
-              print(msg)
-              logs.append(msg)
-
-          async def remove_cookie_overlay(page):
-              await page.evaluate("""
-              () => {
-                  document.querySelectorAll(
-                      '.onetrust-pc-dark-filter,' +
-                      '#onetrust-banner-sdk,' +
-                      '#onetrust-consent-sdk'
-                  ).forEach(e => e.remove());
-
-                  document.body.style.overflow = 'auto';
-              }
-              """)
-
-          async def visible_inputs(page):
-              return await page.locator("input").evaluate_all("""
-              els => els
-                .filter(e => {
-                  const r = e.getBoundingClientRect();
-                  return r.width > 0 && r.height > 0 &&
-                         getComputedStyle(e).visibility !== 'hidden' &&
-                         getComputedStyle(e).display !== 'none';
-                })
-                .map(e => ({
-                  type:e.type,
-                  name:e.name,
-                  id:e.id,
-                  value:e.value,
-                  placeholder:e.placeholder,
-                  aria:e.getAttribute('aria-label'),
-                  outer:e.outerHTML.slice(0,1500)
-                }))
-              """)
-
-          async def buttons(page):
-              return await page.locator("button").evaluate_all("""
-              els => els
-                .filter(e => {
-                  const r = e.getBoundingClientRect();
-                  return r.width > 0 && r.height > 0 &&
-                         getComputedStyle(e).visibility !== 'hidden' &&
-                         getComputedStyle(e).display !== 'none';
-                })
-                .map(e => ({
-                  text:(e.innerText || '').trim(),
-                  aria:e.getAttribute('aria-label'),
-                  type:e.type,
-                  name:e.name,
-                  value:e.value,
-                  outer:e.outerHTML.slice(0,1200)
-                }))
-              """)
-
-          async def forms(page):
-              return await page.locator("form").evaluate_all("""
-              els => els.map(e => ({
-                action:e.action,
-                method:e.method,
-                outer:e.outerHTML.slice(0,6000)
-              }))
-              """)
-
-          async def select_port(page, value):
-              inputs = page.locator("input")
-              count = await inputs.count()
-
-              for i in range(count):
-                  el = inputs.nth(i)
-
-                  try:
-                      if not await el.is_visible():
-                          continue
-
-                      current = await el.input_value()
-
-                      # Port inputs are text inputs containing a current port.
-                      if current and current.strip():
-                          await el.click()
-                          await el.press("Control+A")
-                          await el.fill(value)
-                          await page.wait_for_timeout(500)
-
-                          # Select matching visible option.
-                          option = page.get_by_text(value, exact=True)
-                          if await option.count():
-                              for j in range(await option.count()):
-                                  try:
-                                      if await option.nth(j).is_visible():
-                                          await option.nth(j).click()
-                                          await page.wait_for_timeout(500)
-                                          return True
-                                  except:
-                                      pass
-
-                          await el.press("Enter")
-                          await page.wait_for_timeout(300)
-                          return True
-
-                  except:
-                      pass
-
-              return False
-
-          async def inspect_page(page, label):
-              add("")
-              add("===== " + label + " =====")
-              add("URL: " + page.url)
-
+          async def remove_overlays(page):
               try:
-                  ins = await visible_inputs(page)
-                  add("VISIBLE INPUTS:")
-                  add(json.dumps(ins, ensure_ascii=False, indent=2)[:12000])
-              except Exception as e:
-                  add("INPUT ERROR: " + repr(e))
+                  await page.evaluate("""
+                  () => {
+                    for (const s of [
+                      '#onetrust-banner-sdk',
+                      '#onetrust-consent-sdk',
+                      '.onetrust-pc-dark-filter',
+                      '[id*="cookie" i]',
+                      '[class*="cookie" i]'
+                    ]) {
+                      document.querySelectorAll(s).forEach(e => {
+                        try { e.remove(); } catch (_) {}
+                      });
+                    }
+                    document.body.style.overflow = 'auto';
+                  }
+                  """)
+              except:
+                  pass
 
+          async def get_frames(page):
+              frames = [page.main_frame]
+              for f in page.frames:
+                  if f != page.main_frame:
+                      frames.append(f)
+              return frames
+
+          async def get_visible_inputs(frame):
               try:
-                  btn = await buttons(page)
-                  add("VISIBLE BUTTONS:")
-                  add(json.dumps(btn, ensure_ascii=False, indent=2)[:16000])
-              except Exception as e:
-                  add("BUTTON ERROR: " + repr(e))
+                  return await frame.locator("input").evaluate_all("""
+                  els => els.map((e,i) => {
+                    const r = e.getBoundingClientRect();
+                    return {
+                      i,
+                      type:e.type || '',
+                      name:e.name || '',
+                      id:e.id || '',
+                      value:e.value || '',
+                      placeholder:e.placeholder || '',
+                      aria:e.getAttribute('aria-label') || '',
+                      visible:r.width>0 && r.height>0 &&
+                        getComputedStyle(e).display !== 'none' &&
+                        getComputedStyle(e).visibility !== 'hidden'
+                    }
+                  }).filter(x => x.visible)
+                  """)
+              except:
+                  return []
 
-              try:
-                  frm = await forms(page)
-                  add("FORMS:")
-                  add(json.dumps(frm, ensure_ascii=False, indent=2)[:12000])
-              except Exception as e:
-                  add("FORM ERROR: " + repr(e))
+          async def find_port_inputs(page):
+              candidates = []
 
-          async def set_date(page):
-              add("")
-              add("===== DATE SEARCH =====")
+              for frame in await get_frames(page):
+                  data = await get_visible_inputs(frame)
 
-              data = await page.locator("input").evaluate_all("""
-              els => els.map((e,i) => {
-                const r=e.getBoundingClientRect();
-                return {
-                  i,
-                  type:e.type,
-                  value:e.value,
-                  name:e.name,
-                  id:e.id,
-                  placeholder:e.placeholder,
-                  aria:e.getAttribute('aria-label'),
-                  visible:r.width>0 && r.height>0 &&
-                    getComputedStyle(e).visibility!=='hidden' &&
-                    getComputedStyle(e).display!=='none',
-                  outer:e.outerHTML.slice(0,2000)
-                }
-              })
-              """)
-
-              add(json.dumps(data, ensure_ascii=False, indent=2)[:18000])
-
-              # Try every visible date-like input.
-              for item in data:
-                  if not item["visible"]:
-                      continue
-
-                  typ = (item["type"] or "").lower()
-                  name = (item["name"] or "").lower()
-                  ident = (item["id"] or "").lower()
-                  placeholder = (item["placeholder"] or "").lower()
-                  value = (item["value"] or "").lower()
-
-                  candidate = (
-                      typ == "date"
-                      or "date" in name
-                      or "date" in ident
-                      or "date" in placeholder
-                      or "/" in value
-                      or "-" in value
-                  )
-
-                  if not candidate:
-                      continue
-
-                  el = page.locator("input").nth(item["i"])
-
-                  try:
-                      await el.click()
-                      await page.wait_for_timeout(300)
-
-                      # Try direct fill first.
-                      try:
-                          await el.fill(TARGET_DATE)
-                          add("DATE fill succeeded: " + item["outer"])
-                          return True
-                      except Exception as e:
-                          add("DATE fill failed: " + repr(e))
-
-                      # Try keyboard.
-                      try:
-                          await el.press("Control+A")
-                          await el.type("02/07/2027")
-                          await el.press("Tab")
-                          add("DATE keyboard attempt succeeded")
-                          return True
-                      except Exception as e:
-                          add("DATE keyboard failed: " + repr(e))
-
-                  except Exception as e:
-                      add("DATE candidate failed: " + repr(e))
-
-              return False
-
-          async def try_submit(page):
-              add("")
-              add("===== SUBMIT ATTEMPTS =====")
-
-              # 1. Native submit buttons.
-              candidates = page.locator(
-                  'button[type="submit"], '
-                  'input[type="submit"], '
-                  'button[data-testid*="submit"], '
-                  'button[data-testid*="search"], '
-                  'button[aria-label*="search" i]'
-              )
-
-              count = await candidates.count()
-              add(f"SUBMIT CANDIDATES: {count}")
-
-              for i in range(count):
-                  el = candidates.nth(i)
-                  try:
-                      if await el.is_visible():
-                          add("CLICK SUBMIT: " + await el.evaluate(
-                              "(e)=>e.outerHTML.slice(0,2000)"
-                          ))
-                          await el.click()
-                          await page.wait_for_timeout(4000)
-                          add("URL AFTER SUBMIT: " + page.url)
-                          return True
-                  except Exception as e:
-                      add("SUBMIT CLICK ERROR: " + repr(e))
-
-              # 2. Cabin choice buttons.
-              texts = [
-                  "I do not want to book a cabin",
-                  "I want to book a cabin",
-              ]
-
-              for text in texts:
-                  loc = page.get_by_text(text, exact=True)
-                  count = await loc.count()
-
-                  for i in range(count):
-                      el = loc.nth(i)
-
-                      try:
-                          if await el.is_visible():
-                              add("CLICK CABIN: " + text)
-                              await el.click()
-                              await page.wait_for_timeout(5000)
-                              add("URL AFTER CABIN: " + page.url)
-
-                              await inspect_page(
-                                  page,
-                                  "AFTER CABIN: " + text
-                              )
-
-                              return True
-                      except Exception as e:
-                          add("CABIN CLICK ERROR: " + repr(e))
-
-              # 3. Press Enter on the visible port/date form.
-              try:
-                  forms = page.locator("form")
-                  fc = await forms.count()
-
-                  for i in range(fc):
-                      f = forms.nth(i)
-
-                      if await f.is_visible():
-                          add("TRY FORM ENTER")
-                          await f.press("Enter")
-                          await page.wait_for_timeout(5000)
-                          add("URL AFTER FORM ENTER: " + page.url)
-                          return True
-              except Exception as e:
-                  add("FORM ENTER ERROR: " + repr(e))
-
-              return False
-
-          async def check_route(page, origin, destination):
-              label = f"{origin} -> {destination}"
-              add("")
-              add("########################################")
-              add(label)
-              add("########################################")
-
-              await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-              await page.wait_for_timeout(3000)
-
-              await remove_cookie_overlay(page)
-
-              add("INITIAL URL: " + page.url)
-
-              # Find visible text inputs and use first two suitable port fields.
-              inputs = page.locator("input")
-              count = await inputs.count()
-
-              port_indices = []
-
-              for i in range(count):
-                  el = inputs.nth(i)
-                  try:
-                      if not await el.is_visible():
-                          continue
-
-                      typ = (await el.get_attribute("type") or "").lower()
+                  for x in data:
+                      typ = x["type"].lower()
                       if typ not in ("text", "search", ""):
                           continue
 
-                      port_indices.append(i)
+                      value = clean(x["value"])
+                      placeholder = clean(x["placeholder"]).lower()
+                      aria = clean(x["aria"]).lower()
+
+                      # Ignore generic site search.
+                      if "search for anything" in placeholder:
+                          continue
+
+                      if any(k in placeholder + " " + aria for k in [
+                          "from", "to", "port", "sail"
+                      ]):
+                          candidates.append((frame, x["i"], x))
+
+                  if len(candidates) >= 2:
+                      return candidates[:2]
+
+              # Fallback: visible text inputs whose values resemble ports.
+              for frame in await get_frames(page):
+                  data = await get_visible_inputs(frame)
+                  for x in data:
+                      if x["type"].lower() not in ("text", "search", ""):
+                          continue
+                      if "search for anything" in clean(x["placeholder"]).lower():
+                          continue
+                      candidates.append((frame, x["i"], x))
+
+                  if len(candidates) >= 2:
+                      return candidates[:2]
+
+              return candidates[:2]
+
+          async def choose_option(frame, text):
+              text = clean(text)
+
+              # Exact text first.
+              loc = frame.get_by_text(text, exact=True)
+
+              for i in range(await loc.count()):
+                  try:
+                      if await loc.nth(i).is_visible():
+                          await loc.nth(i).click()
+                          await frame.page.wait_for_timeout(500)
+                          return True
                   except:
                       pass
 
-              add("VISIBLE TEXT INPUT INDICES: " + str(port_indices))
-
-              # Use current values to distinguish the two port fields.
-              if len(port_indices) >= 2:
-                  try:
-                      a = inputs.nth(port_indices[0])
-                      b = inputs.nth(port_indices[1])
-
-                      await a.click()
-                      await a.press("Control+A")
-                      await a.fill(origin)
-                      await page.wait_for_timeout(500)
-
-                      opt = page.get_by_text(origin, exact=True)
-                      for j in range(await opt.count()):
-                          if await opt.nth(j).is_visible():
-                              await opt.nth(j).click()
-                              break
-
-                      await page.wait_for_timeout(300)
-
-                      await b.click()
-                      await b.press("Control+A")
-                      await b.fill(destination)
-                      await page.wait_for_timeout(500)
-
-                      opt = page.get_by_text(destination, exact=True)
-                      for j in range(await opt.count()):
-                          if await opt.nth(j).is_visible():
-                              await opt.nth(j).click()
-                              break
-
-                      await page.wait_for_timeout(500)
-
-                  except Exception as e:
-                      add("PORT SELECTION ERROR: " + repr(e))
-
-              await inspect_page(page, "AFTER PORT SELECTION " + label)
-
-              date_ok = await set_date(page)
-              add("DATE RESULT: " + str(date_ok))
-
-              await remove_cookie_overlay(page)
-
-              await inspect_page(page, "BEFORE SUBMIT " + label)
-
-              await try_submit(page)
-
-              await page.wait_for_timeout(5000)
-
-              add("FINAL URL: " + page.url)
-
+              # Then role option.
               try:
-                  await page.screenshot(
-                      path=f"final_{origin}_{destination}.png",
-                      full_page=True
-                  )
-              except:
-                  pass
-
-              try:
-                  with open(
-                      f"html_{origin}_{destination}.html",
-                      "w",
-                      encoding="utf-8"
-                  ) as f:
-                      f.write(await page.content())
-              except:
-                  pass
-
-          async def main():
-              async with async_playwright() as p:
-                  browser = await p.chromium.launch(
-                      headless=True,
-                      args=[
-                          "--disable-blink-features=AutomationControlled",
-                      ],
-                  )
-
-                  context = await browser.new_context(
-                      viewport={"width":1440, "height":1200},
-                      locale="en-GB",
-                      timezone_id="Europe/Oslo",
-                  )
-
-                  page = await context.new_page()
-
-                  async def on_request(req):
-                      if req.resource_type in ("xhr", "fetch"):
-                          u = req.url
-
-                          # Keep only potentially useful requests.
-                          if any(x in u.lower() for x in [
-                              "hurtigruten",
-                              "booking",
-                              "availability",
-                              "voyage",
-                              "sailing",
-                              "search",
-                              "api",
-                              "salesforce",
-                          ]):
-                              post = redact(req.post_data or "")
-
-                              add(
-                                  "REQUEST "
-                                  + req.method
-                                  + " "
-                                  + redact(u)
-                                  + (
-                                      "\nPOST="
-                                      + post
-                                      if post else ""
-                                  )
-                              )
-
-                  async def on_response(resp):
-                      if resp.request.resource_type in ("xhr", "fetch"):
-                          u = resp.url
-
-                          if any(x in u.lower() for x in [
-                              "hurtigruten",
-                              "booking",
-                              "availability",
-                              "voyage",
-                              "sailing",
-                              "search",
-                              "api",
-                              "salesforce",
-                          ]):
-                              add(
-                                  "RESPONSE "
-                                  + str(resp.status)
-                                  + " "
-                                  + redact(u)
-                              )
-
-                  page.on("request", on_request)
-                  page.on("response", on_response)
-
-                  for origin, destination in ROUTES:
-                      try:
-                          await check_route(page, origin, destination)
-                      except Exception as e:
-                          add(
-                              f"ROUTE ERROR {origin}->{destination}: "
-                              + repr(e)
-                          )
-
-                  await browser.close()
-
-              with open("diagnostic.txt", "w", encoding="utf-8") as f:
-                  f.write("\n".join(logs))
-
-          if __name__ == "__main__":
-              asyncio.run(main())
-          PY
-
-      - name: Run diagnostic
-        run: |
-          python monitor.py
-
-      - name: Send diagnostic email
-        if: always()
-        env:
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
-        run: |
-          python - <<'PY'
-          import os
-          import smtplib
-          from email.mime.text import MIMEText
-
-          user = os.environ["SMTP_USER"]
-          password = os.environ["SMTP_PASSWORD"]
-          to = os.environ["ALERT_EMAIL"]
-
-          try:
-              with open("diagnostic.txt", "r", encoding="utf-8") as f:
-                  text = f.read()
-          except Exception as e:
-              text = "Unable to read diagnostic.txt: " + repr(e)
-
-          # Keep the email manageable.
-          if len(text) > 50000:
-              text = text[-50000:]
-
-          msg = MIMEText(text, "plain", "utf-8")
-          msg["Subject"] = "Hurtigruten Action Diagnostic"
-          msg["From"] = user
-          msg["To"] = to
-
-          with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as smtp:
-              smtp.login(user, password)
-              smtp.sendmail(user, [to], msg.as_string())
-
-          print("Diagnostic email sent.")
-          PY
-
-      - name: Upload diagnostic artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hurtigruten-action-diagnostic
-          path: |
-            diagnostic.txt
-            *.png
-            *.html
-            monitor.py
-          if-no-files-found: ignore
+                  loc = frame.get_by_role("option", name=text)
+                  for i in range(await loc.count()):
+                      if await loc.nth(i).is_visible():
+                         
