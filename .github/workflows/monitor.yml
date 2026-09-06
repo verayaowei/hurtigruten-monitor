@@ -24,15 +24,15 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
-      - name: Create monitor
+      - name: Create diagnostic monitor
         run: |
           cat > monitor.py <<'PY'
           import os
-          import re
           import time
+          import re
           import smtplib
           from email.mime.text import MIMEText
-          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          from playwright.sync_api import sync_playwright
 
           TARGET_DATE = "2027-02-07"
 
@@ -43,7 +43,6 @@ jobs:
           ]
 
           URL = "https://www.hurtigruten.com/en/port-to-port"
-          BOOKING_URL = "https://www.hurtigruten.com/en/port-to-port/booking"
 
           SMTP_USER = os.environ["SMTP_USER"]
           SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
@@ -56,9 +55,17 @@ jobs:
               msg["From"] = SMTP_USER
               msg["To"] = ALERT_EMAIL
 
-              with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as server:
-                  server.login(SMTP_USER, SMTP_PASSWORD)
-                  server.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
+              with smtplib.SMTP_SSL(
+                  "smtp.qq.com",
+                  465,
+                  timeout=30
+              ) as s:
+                  s.login(SMTP_USER, SMTP_PASSWORD)
+                  s.sendmail(
+                      SMTP_USER,
+                      [ALERT_EMAIL],
+                      msg.as_string()
+                  )
 
 
           def close_cookie_popup(page):
@@ -72,63 +79,64 @@ jobs:
               for selector in selectors:
                   try:
                       loc = page.locator(selector)
-                      if loc.count() > 0 and loc.first.is_visible():
-                          loc.first.click(force=True, timeout=2000)
-                          time.sleep(0.5)
-                          break
+
+                      if loc.count() > 0:
+                          for i in range(loc.count()):
+                              x = loc.nth(i)
+
+                              if x.is_visible():
+                                  x.click(
+                                      force=True,
+                                      timeout=2000
+                                  )
+                                  break
                   except:
                       pass
 
               try:
-                  page.locator(".onetrust-pc-dark-filter").evaluate_all(
-                      "(els) => els.forEach(e => e.remove())"
-                  )
-              except:
-                  pass
-
-              try:
-                  page.locator("#onetrust-consent-sdk").evaluate(
-                      "(e) => e.style.pointerEvents='none'"
+                  page.locator(
+                      ".onetrust-pc-dark-filter"
+                  ).evaluate_all(
+                      "(x) => x.forEach(e => e.remove())"
                   )
               except:
                   pass
 
 
-          def get_frames(page):
-              frames = [page]
-              for frame in page.frames:
-                  if frame != page:
-                      frames.append(frame)
-              return frames
+          def frames(page):
+              result = [page]
+
+              for f in page.frames:
+                  if f != page:
+                      result.append(f)
+
+              return result
 
 
-          def find_port_input(page, field):
-              selectors = []
-
+          def find_input(page, field):
               if field == "from":
                   selectors = [
                       'input[placeholder="Sail from where?"]',
                       'input[placeholder*="Sail from" i]',
                       'input[aria-label*="Sail from" i]',
-                      'input[aria-label*="From" i]',
                   ]
               else:
                   selectors = [
                       'input[placeholder="Sail to where?"]',
                       'input[placeholder*="Sail to" i]',
                       'input[aria-label*="Sail to" i]',
-                      'input[aria-label*="To" i]',
                   ]
 
-              for frame in get_frames(page):
+              for frame in frames(page):
                   for selector in selectors:
                       try:
                           loc = frame.locator(selector)
-                          if loc.count() > 0:
-                              for i in range(loc.count()):
-                                  item = loc.nth(i)
-                                  if item.is_visible():
-                                      return frame, item
+
+                          for i in range(loc.count()):
+                              x = loc.nth(i)
+
+                              if x.is_visible():
+                                  return frame, x
                       except:
                           pass
 
@@ -138,344 +146,337 @@ jobs:
           def select_port(page, port, field):
               close_cookie_popup(page)
 
-              frame, inp = find_port_input(page, field)
+              frame, inp = find_input(page, field)
 
               if inp is None:
                   raise RuntimeError(
-                      f"Could not find {field} port input for {port}"
+                      f"Cannot find {field} input: {port}"
                   )
 
               inp.click(force=True)
               inp.fill("")
               inp.type(port, delay=80)
 
-              time.sleep(1.5)
+              time.sleep(2)
 
-              # Try visible autocomplete options in the same frame.
-              option_selectors = [
+              # First try exact visible text.
+              for selector in [
                   '[role="option"]:visible',
                   'li:visible',
                   '[data-testid*="option" i]:visible',
-              ]
-
-              for selector in option_selectors:
+              ]:
                   try:
-                      options = frame.locator(selector)
-                      for i in range(options.count()):
-                          option = options.nth(i)
-                          if not option.is_visible():
+                      loc = frame.locator(selector)
+
+                      for i in range(loc.count()):
+                          x = loc.nth(i)
+
+                          if not x.is_visible():
                               continue
 
-                          text = option.inner_text().strip()
+                          text = x.inner_text().strip()
 
                           if port.lower() in text.lower():
-                              option.click(force=True)
+                              x.click(force=True)
                               time.sleep(1)
                               return
                   except:
                       pass
 
-              # Keyboard fallback.
               inp.press("ArrowDown")
               inp.press("Enter")
               time.sleep(1)
 
 
-          def find_search_control(page):
-              names = [
-                  "Search",
-                  "Search availability",
-                  "Show availability",
-                  "Find availability",
-                  "Check availability",
-                  "Continue",
-                  "View availability",
-                  "Find sailings",
-              ]
-
-              # IMPORTANT:
-              # Search the iframe as well as the main page.
-              for frame in get_frames(page):
-                  for name in names:
-                      try:
-                          loc = frame.get_by_role(
-                              "button",
-                              name=re.compile(name, re.I)
-                          )
-
-                          if loc.count() > 0:
-                              for i in range(loc.count()):
-                                  b = loc.nth(i)
-                                  if b.is_visible():
-                                      return frame, b
-                      except:
-                          pass
-
-                  # Submit buttons
-                  for selector in [
-                      'button[type="submit"]:visible',
-                      'input[type="submit"]:visible',
-                  ]:
-                      try:
-                          loc = frame.locator(selector)
-                          if loc.count() > 0:
-                              return frame, loc.first
-                      except:
-                          pass
-
-              return None, None
-
-
-          def dump_page(page, prefix):
+          def dump(page):
               try:
                   page.screenshot(
-                      path=f"{prefix}.png",
+                      path="diagnostic.png",
                       full_page=True
                   )
               except:
                   pass
 
               try:
-                  with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+                  with open(
+                      "diagnostic.html",
+                      "w",
+                      encoding="utf-8"
+                  ) as f:
                       f.write(page.content())
               except:
                   pass
 
-              try:
-                  with open(f"{prefix}_frames.txt", "w", encoding="utf-8") as f:
-                      for i, frame in enumerate(page.frames):
+              with open(
+                  "diagnostic_frames.txt",
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+
+                  for n, frame in enumerate(frames(page)):
+                      f.write(
+                          "\n==============================\n"
+                      )
+                      f.write(
+                          f"FRAME {n}\n"
+                      )
+                      f.write(
+                          f"URL: {frame.url}\n\n"
+                      )
+
+                      try:
                           f.write(
-                              f"\nFRAME {i}\n"
-                              f"URL: {frame.url}\n"
+                              frame.locator(
+                                  "body"
+                              ).inner_text(
+                                  timeout=5000
+                              )[:30000]
+                          )
+                      except Exception as e:
+                          f.write(
+                              f"\nBODY ERROR: {e}\n"
                           )
 
+                      f.write("\n")
+
+
+          def inspect_elements(page):
+              result = []
+
+              for n, frame in enumerate(frames(page)):
+                  try:
+                      buttons = frame.locator(
+                          "button, a, input, [role='button']"
+                      )
+
+                      for i in range(
+                          min(buttons.count(), 300)
+                      ):
+                          x = buttons.nth(i)
+
                           try:
-                              f.write(
-                                  frame.locator("body").inner_text(
-                                      timeout=3000
-                                  )[:15000]
+                              if not x.is_visible():
+                                  continue
+
+                              text = (
+                                  x.inner_text()
+                                  .strip()
+                              )
+
+                              aria = (
+                                  x.get_attribute(
+                                      "aria-label"
+                                  ) or ""
+                              )
+
+                              title = (
+                                  x.get_attribute(
+                                      "title"
+                                  ) or ""
+                              )
+
+                              value = (
+                                  x.get_attribute(
+                                      "value"
+                                  ) or ""
+                              )
+
+                              result.append(
+                                  f"FRAME {n} | "
+                                  f"TAG={x.evaluate('(e)=>e.tagName')} | "
+                                  f"TEXT={text!r} | "
+                                  f"ARIA={aria!r} | "
+                                  f"TITLE={title!r} | "
+                                  f"VALUE={value!r}"
                               )
                           except:
                               pass
-              except:
-                  pass
-
-
-          def date_text_found(text):
-              t = text.lower()
-
-              patterns = [
-                  "07/02/2027",
-                  "7/2/2027",
-                  "07-02-2027",
-                  "2027-02-07",
-                  "7 february 2027",
-                  "07 february 2027",
-                  "7 feb 2027",
-                  "07 feb 2027",
-                  "february 7, 2027",
-                  "feb 7, 2027",
-              ]
-
-              return any(p.lower() in t for p in patterns)
-
-
-          def inspect_for_target(page):
-              # Look through every frame because the booking widget is iframe based.
-              for frame in get_frames(page):
-                  try:
-                      text = frame.locator("body").inner_text(timeout=3000)
-
-                      if date_text_found(text):
-                          return True
-
-                      # Look for availability indicators.
-                      positive = [
-                          "available",
-                          "availability",
-                          "sailing",
-                          "departure",
-                          "book now",
-                          "select",
-                      ]
-
-                      if any(x in text.lower() for x in positive):
-                          # Do not immediately call this available.
-                          # Only return true if target date is actually present.
-                          pass
 
                   except:
                       pass
 
-              return False
-
-
-          def click_search(page):
-              frame, button = find_search_control(page)
-
-              if button is None:
-                  dump_page(page, "search_button_missing")
-                  raise RuntimeError(
-                      "Could not find Search/Availability control in page or iframe"
+              with open(
+                  "diagnostic_elements.txt",
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  f.write(
+                      "\n".join(result)
                   )
-
-              button.click(force=True)
-              time.sleep(5)
-
-
-          def check_route(page, from_port, to_port):
-              page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-              page.wait_for_timeout(5000)
-
-              close_cookie_popup(page)
-
-              # The public Port-to-Port page contains the actual form.
-              select_port(page, from_port, "from")
-              select_port(page, to_port, "to")
-
-              # Try the actual control inside the iframe.
-              click_search(page)
-
-              # Wait for navigation / booking widget update.
-              page.wait_for_timeout(5000)
-
-              # Save diagnostics regardless of result.
-              safe_name = (
-                  from_port.replace(" ", "_")
-                  + "_"
-                  + to_port.replace(" ", "_")
-              )
-
-              dump_page(page, safe_name)
-
-              # Inspect all frames.
-              if inspect_for_target(page):
-                  return True
-
-              # Also inspect current URL.
-              current_url = page.url
-
-              if TARGET_DATE in current_url:
-                  return True
-
-              # Search text in every frame for explicit target date.
-              for frame in get_frames(page):
-                  try:
-                      body = frame.locator("body").inner_text(timeout=3000)
-
-                      if TARGET_DATE in body:
-                          return True
-
-                      # Normalize whitespace.
-                      normalized = re.sub(r"\s+", " ", body)
-
-                      if date_text_found(normalized):
-                          return True
-
-                  except:
-                      pass
-
-              return False
 
 
           def main():
-              errors = []
-              available = []
+              logs = []
 
               with sync_playwright() as p:
+
                   browser = p.chromium.launch(
-                      headless=True,
-                      args=[
-                          "--disable-blink-features=AutomationControlled",
-                      ],
+                      headless=True
                   )
 
                   context = browser.new_context(
-                      viewport={"width": 1440, "height": 1000},
+                      viewport={
+                          "width": 1440,
+                          "height": 1000
+                      },
                       locale="en-GB",
                       timezone_id="Europe/Oslo",
                   )
 
                   page = context.new_page()
 
-                  for from_port, to_port in ROUTES:
-                      route = f"{from_port} -> {to_port}"
+                  # Record every navigation.
+                  page.on(
+                      "framenavigated",
+                      lambda frame:
+                      print(
+                          "NAVIGATION:",
+                          frame.url
+                      )
+                  )
 
-                      try:
-                          print(f"Checking {route}")
+                  # Record requests.
+                  def request_handler(req):
+                      u = req.url.lower()
 
-                          result = check_route(
-                              page,
-                              from_port,
-                              to_port
+                      if any(
+                          x in u
+                          for x in [
+                              "search",
+                              "booking",
+                              "availability",
+                              "sailing",
+                              "journey",
+                              "api",
+                              "graphql"
+                          ]
+                      ):
+                          print(
+                              "REQUEST:",
+                              req.method,
+                              req.url
                           )
 
-                          if result:
-                              print(
-                                  f"TARGET DATE FOUND: {route}"
-                              )
-                              available.append(route)
-                          else:
-                              print(
-                                  f"No confirmed target date: {route}"
-                              )
+                  page.on(
+                      "request",
+                      request_handler
+                  )
 
-                      except Exception as e:
-                          error = (
-                              f"{type(e).__name__}: {e}"
+                  for from_port, to_port in ROUTES:
+
+                      route = (
+                          f"{from_port} -> {to_port}"
+                      )
+
+                      print(
+                          "\n\n==========",
+                          route,
+                          "=========="
+                      )
+
+                      try:
+                          page.goto(
+                              URL,
+                              wait_until="domcontentloaded",
+                              timeout=60000
+                          )
+
+                          page.wait_for_timeout(5000)
+
+                          close_cookie_popup(page)
+
+                          select_port(
+                              page,
+                              from_port,
+                              "from"
+                          )
+
+                          select_port(
+                              page,
+                              to_port,
+                              "to"
                           )
 
                           print(
-                              f"ERROR {route}: {error}"
+                              "PORTS SELECTED:",
+                              route
                           )
 
-                          errors.append(
-                              f"{route}\n{error}"
+                          # IMPORTANT:
+                          # Do NOT guess the button.
+                          # Record the complete live page structure.
+                          inspect_elements(page)
+                          dump(page)
+
+                          # Try natural keyboard submission.
+                          # This allows forms to submit without knowing
+                          # the button's label.
+                          for frame in frames(page):
+
+                              try:
+                                  body = frame.locator(
+                                      "body"
+                                  )
+
+                                  body.click(
+                                      position={
+                                          "x": 10,
+                                          "y": 10
+                                      },
+                                      force=True
+                                  )
+
+                                  frame.locator(
+                                      "body"
+                                  ).press(
+                                      "Enter"
+                                  )
+
+                              except:
+                                  pass
+
+                          page.wait_for_timeout(8000)
+
+                          print(
+                              "AFTER ENTER URL:",
+                              page.url
                           )
+
+                          inspect_elements(page)
+                          dump(page)
+
+                      except Exception as e:
+
+                          text = (
+                              f"{route}: "
+                              f"{type(e).__name__}: {e}"
+                          )
+
+                          print(text)
+                          logs.append(text)
 
                   browser.close()
 
-              # Availability email.
-              if available:
-                  body = (
-                      "Hurtigruten availability detected\n\n"
-                      f"Target date: {TARGET_DATE}\n\n"
-                      + "\n".join(
-                          f"AVAILABLE: {r}"
-                          for r in available
-                      )
-                      + "\n\n"
-                      "Please check the Hurtigruten booking page."
-                  )
+              body = (
+                  "Hurtigruten diagnostic run\n\n"
+                  f"Target date: {TARGET_DATE}\n\n"
+                  + "\n".join(logs)
+                  + "\n\n"
+                  "IMPORTANT: This run records the actual "
+                  "booking page controls and URLs."
+              )
 
-                  send_email(
-                      "Hurtigruten AVAILABLE",
-                      body
-                  )
-
-              # Error email.
-              if errors:
-                  body = (
-                      "Hurtigruten monitor ERROR\n\n"
-                      f"Target date: {TARGET_DATE}\n\n"
-                      + "\n\n".join(errors)
-                  )
-
-                  send_email(
-                      "Hurtigruten monitor ERROR",
-                      body
-                  )
-
-              # Do not fail GitHub Actions merely because
-              # a route is temporarily unavailable.
-              print("Monitor finished.")
+              send_email(
+                  "Hurtigruten diagnostic",
+                  body
+              )
 
 
           if __name__ == "__main__":
               main()
           PY
 
-      - name: Run monitor
+      - name: Run diagnostic
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
@@ -483,14 +484,15 @@ jobs:
         run: |
           python monitor.py
 
-      - name: Upload diagnostics
+      - name: Upload diagnostic files
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: hurtigruten-diagnostics
+          name: hurtigruten-real-page-diagnostics
           path: |
-            *.png
-            *.html
-            *_frames.txt
+            diagnostic.png
+            diagnostic.html
+            diagnostic_frames.txt
+            diagnostic_elements.txt
             monitor.py
           if-no-files-found: ignore
